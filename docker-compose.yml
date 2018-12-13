@@ -1,0 +1,12 @@
+version: '3.5'
+
+services:
+  nyzo-verifier:
+    container_name: nyzo-verifier
+    image: nyzo-verifier
+    build: .
+    ports:
+      - target: 9444
+        published: 9444
+        protocol: tcp
+        mode: host
