@@ -8,19 +8,22 @@ import co.nyzo.verifier.util.PrintUtil;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class UnfrozenBlockManager {
 
-    private static Map<Long, Map<ByteBuffer, Block>> unfrozenBlocks = new HashMap<>();
-    private static Map<Long, Integer> thresholdOverrides = new HashMap<>();
-    private static Map<Long, byte[]> hashOverrides = new HashMap<>();
+    private static Map<Long, Map<ByteBuffer, Block>> unfrozenBlocks = new ConcurrentHashMap<>();
+    private static Map<Long, Integer> thresholdOverrides = new ConcurrentHashMap<>();
+    private static Map<Long, byte[]> hashOverrides = new ConcurrentHashMap<>();
 
-    private static Map<Long, Map<ByteBuffer, Block>> disconnectedBlocks = new HashMap<>();
+    private static String voteDescription = "*** not yet voted ***";
+
+    private static Map<Long, Map<ByteBuffer, Block>> disconnectedBlocks = new ConcurrentHashMap<>();
 
     private static long lastBlockVoteTimestamp = 0L;
 
-    public static synchronized void attemptToRegisterDisconnectedBlocks() {
+    public static void attemptToRegisterDisconnectedBlocks() {
 
         // Remove the disconnected blocks one past the frozen edge from the disconnected map. Attempt to register them.
         long frozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
@@ -30,16 +33,9 @@ public class UnfrozenBlockManager {
                 registerBlock(block);
             }
         }
-
-        // Remove lower heights that may have been skipped.
-        for (long height : new HashSet<>(disconnectedBlocks.keySet())) {
-            if (height <= frozenEdgeHeight) {
-                disconnectedBlocks.remove(height);
-            }
-        }
     }
 
-    public static synchronized boolean registerBlock(Block block) {
+    public static boolean registerBlock(Block block) {
 
         boolean registeredBlock = false;
 
@@ -61,22 +57,29 @@ public class UnfrozenBlockManager {
 
             // Check if the block has a valid verification timestamp. We cannot be sure of this, but we can filter out
             // some invalid blocks at this point.
-            boolean verificationTimestampIntervalValid = true;
+            boolean verificationTimestampValid = true;
             if (!alreadyContainsBlock) {
+
+                // Check that the interval is not less than the minimum.
                 Block previousBlock = block.getPreviousBlock();
                 if (previousBlock != null && previousBlock.getVerificationTimestamp() >
                         block.getVerificationTimestamp() - Block.minimumVerificationInterval) {
-                    verificationTimestampIntervalValid = false;
+                    verificationTimestampValid = false;
+                }
+
+                // Check that the verification timestamp is not unreasonably far into the future.
+                if (block.getVerificationTimestamp() > System.currentTimeMillis() + 5000L) {
+                    verificationTimestampValid = false;
                 }
             }
 
-            if (!alreadyContainsBlock && verificationTimestampIntervalValid) {
+            if (!alreadyContainsBlock && verificationTimestampValid) {
 
                 // At this point, it is prudent to independently calculate the balance list. We only register the block
-                // if we can calculate the balance list and if the has matches what we expect. This will ensure that no
+                // if we can calculate the balance list and if the hash matches what we expect. This will ensure that no
                 // blocks with invalid transactions are registered (they will be removed in the balance-list
                 // calculation, and the hash will not match).
-                BalanceList balanceList = BalanceListManager.balanceListForBlock(block, new StringBuilder());
+                BalanceList balanceList = BalanceListManager.balanceListForBlock(block);
                 if (balanceList != null && ByteUtil.arraysAreEqual(balanceList.getHash(), block.getBalanceListHash())) {
 
                     blocksAtHeight.put(ByteBuffer.wrap(block.getHash()), block);
@@ -117,7 +120,7 @@ public class UnfrozenBlockManager {
         return registeredBlock;
     }
 
-    public static synchronized void updateVote() {
+    public static void updateVote() {
 
         // Only vote for the first height past the frozen edge, and only continue if we have blocks and have not voted
         // for this height in less than the minimum interval time (the additional 200ms is to account for network
@@ -133,10 +136,36 @@ public class UnfrozenBlockManager {
             // requires multiple broadcasts.
             byte[] newVoteHash = null;
 
-            if (hashOverrides.containsKey(height)) {
+            String voteDescription;
+            byte[] hashOverride = hashOverrides.get(height);
+            if (hashOverride != null) {
 
                 // We always use an override if one is available.
-                newVoteHash = hashOverrides.get(height);
+                newVoteHash = hashOverride;
+
+                voteDescription = "override; ";
+
+            } else if (BlockManager.inGenesisCycle()) {
+
+                voteDescription = "Genesis cycle; ";
+
+                // In the Genesis cycle, we always vote for the lowest score available at any time.
+                Block lowestScoredBlock = null;
+                long lowestChainScore = Long.MAX_VALUE;
+                for (Block block : blocksForHeight.values()) {
+                    long blockChainScore = block.chainScore(frozenEdgeHeight);
+                    if (lowestScoredBlock == null || blockChainScore < lowestChainScore) {
+                        lowestChainScore = blockChainScore;
+                        lowestScoredBlock = block;
+                    }
+                }
+                System.out.println("(Genesis) lowest-scored block: " + lowestScoredBlock + ", score: " +
+                        lowestChainScore);
+
+                if (lowestScoredBlock != null) {
+                    newVoteHash = lowestScoredBlock.getHash();
+                }
+
             } else {
                 Block newVoteBlock = null;
 
@@ -145,9 +174,9 @@ public class UnfrozenBlockManager {
                 // than 10 seconds ago, vote for it even if it does not exceed 50%. This allows us to reach consensus
                 // even if no hash exceeds 50%. We do not try to agree with the rest of the cycle until we receive at
                 // least 75% of the vote for the height.
-                int votingPoolSize = BlockManager.inGenesisCycle() ? NodeManager.getMeshSize() :
-                        BlockManager.currentCycleLength();
-                if (BlockVoteManager.numberOfVotesAtHeight(height) > votingPoolSize * 3 / 4) {
+                int votingPoolSize = BlockManager.currentCycleLength();
+                int numberOfVotesAtHeight = BlockVoteManager.numberOfVotesAtHeight(height);
+                if (numberOfVotesAtHeight > votingPoolSize * 3 / 4) {
                     AtomicInteger voteCountWrapper = new AtomicInteger(0);
                     byte[] leadingHash = BlockVoteManager.leadingHashForHeight(height, voteCountWrapper);
                     Block leadingHashBlock = unfrozenBlockAtHeight(height, leadingHash);
@@ -157,8 +186,15 @@ public class UnfrozenBlockManager {
                                 System.currentTimeMillis()) ||
                                 leadingHashBlock.getMinimumVoteTimestamp() < System.currentTimeMillis() - 10000L) {
                             newVoteBlock = leadingHashBlock;
+                            voteDescription = "leading; ";
+                        } else {
+                            voteDescription = "insufficient leading score; ";
                         }
+                    } else {
+                        voteDescription = "missing leading; ";
                     }
+                } else {
+                    voteDescription = "insufficient count=" + numberOfVotesAtHeight + "; ";
                 }
 
                 // If we did not determine a vote to agree with the rest of the mesh, then we independently choose the
@@ -180,13 +216,19 @@ public class UnfrozenBlockManager {
                             lowestScoredBlock.getMinimumVoteTimestamp() <= System.currentTimeMillis()) {
 
                         newVoteBlock = lowestScoredBlock;
+                        voteDescription += "lowest-scored; ";
                     }
                 }
 
                 if (newVoteBlock != null) {
                     newVoteHash = newVoteBlock.getHash();
+                    voteDescription += "h=" + height + "; " + PrintUtil.compactPrintByteArray(newVoteHash);
+                } else {
+                    voteDescription += "h=" + height + "; undetermined";
                 }
             }
+
+            UnfrozenBlockManager.voteDescription = voteDescription;
 
             // If we determined a vote, broadcast it to the cycle.
             if (newVoteHash != null) {
@@ -195,7 +237,7 @@ public class UnfrozenBlockManager {
         }
     }
 
-    private static synchronized void castVote(long height, byte[] hash) {
+    public static void castVote(long height, byte[] hash) {
 
         System.out.println("^^^^^^^^^^^^^^^^^^^^^ casting vote for height " + height);
         lastBlockVoteTimestamp = System.currentTimeMillis();
@@ -211,7 +253,7 @@ public class UnfrozenBlockManager {
         }
     }
 
-    public static synchronized void attemptToFreezeBlock() {
+    public static boolean attemptToFreezeBlock() {
 
         long frozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
         long heightToFreeze = frozenEdgeHeight + 1;
@@ -228,14 +270,101 @@ public class UnfrozenBlockManager {
         int voteCountThreshold = thresholdOverrides.containsKey(heightToFreeze) ?
                 votingPoolSize * thresholdOverrides.get(heightToFreeze) / 100 :
                 votingPoolSize * 3 / 4;
+        boolean frozeBlock = false;
         if (voteCount > voteCountThreshold) {
 
             Block block = unfrozenBlockAtHeight(heightToFreeze, leadingHash);
             if (block != null) {
                 System.out.println("freezing block " + block + " with standard mechanism");
                 BlockManager.freezeBlock(block);
+                frozeBlock = true;
             }
         }
+
+        return frozeBlock;
+    }
+
+    public static void attemptToFreezeChain() {
+
+        // The logic to freeze a section of the chain is different. This only happens in a situation where this
+        // verifier has had problems tracking the chain and is trying to catch up. Only the 75% threshold is used, and
+        // it must be surpassed for two consecutive blocks. If it is surpassed for two consecutive blocks, and if all
+        // of the blocks from the second passing block all the way back to the frozen edge are available, then the
+        // entire chain to the first of the two consecutive blocks is frozen.
+
+        // This method freezes the shortest length of chain that it can freeze. As this is a recovery method, the idea
+        // is to make some progress while taking as little risk as possible.
+
+        // To avoid unnecessary work, only attempt this process if we have votes for at least five different heights.
+        List<Long> voteHeights = BlockVoteManager.getHeights();
+
+        int votingPoolSize = BlockManager.inGenesisCycle() ? NodeManager.getMeshSize() :
+                BlockManager.currentCycleLength();
+        int voteCountThreshold = votingPoolSize * 3 / 4;
+
+        long firstPassingHeight = -1L;
+        byte[] firstPassingHash = null;
+        boolean foundSecondPassingHeight = false;
+        long frozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
+        for (int i = 0; i < voteHeights.size() && !foundSecondPassingHeight; i++) {
+
+            long height = voteHeights.get(i);
+            if (height > frozenEdgeHeight + 1) {
+                AtomicInteger voteCount = new AtomicInteger(0);
+                byte[] leadingHash = BlockVoteManager.leadingHashForHeight(height, voteCount);
+                if (voteCount.get() > voteCountThreshold) {
+
+                    // If this is the second consecutive block that qualifies for a vote, check the previous-block
+                    // hash to ensure that the second block is a successor of the first.
+                    if (height == firstPassingHeight + 1) {
+                        Block blockAtSecondHeight = unverifiedBlockAtHeight(height, leadingHash);
+                        if (blockAtSecondHeight != null &&
+                                ByteUtil.arraysAreEqual(blockAtSecondHeight.getPreviousBlockHash(),
+                                        firstPassingHash)) {
+                            foundSecondPassingHeight = true;
+                        }
+                    }
+
+                    // If a second passing height was not established, the vote count still qualifies this height
+                    // as a first passing height.
+                    if (!foundSecondPassingHeight) {
+                        firstPassingHeight = height;
+                        firstPassingHash = leadingHash;
+                    }
+                }
+            }
+        }
+
+        // If a second passing height was found, try to freeze the entire section of chain to the first passing
+        // height.
+        if (foundSecondPassingHeight) {
+
+            List<Block> blocks = new ArrayList<>();
+            boolean allBlocksAvailable = true;
+            byte[] hash = firstPassingHash;
+            for (long height = firstPassingHeight; height > frozenEdgeHeight && allBlocksAvailable; height--) {
+
+                // Try to get the block for this height.
+                Block block = unverifiedBlockAtHeight(height, hash);
+
+                // If the block is not available, this section of chain cannot be frozen. If it is available, add
+                // it to the beginning of the list and continue stepping toward the frozen edge.
+                if (block == null) {
+                    allBlocksAvailable = false;
+                } else {
+                    blocks.add(0, block);
+                    hash = block.getPreviousBlockHash();
+                }
+            }
+
+            if (allBlocksAvailable) {
+                for (Block block : blocks) {
+                    System.out.println("freezing chain block " + block);
+                    BlockManager.freezeBlock(block);
+                }
+            }
+        }
+
     }
 
     public static void performMaintenance() {
@@ -251,6 +380,13 @@ public class UnfrozenBlockManager {
         for (Long height : new HashSet<>(unfrozenBlocks.keySet())) {
             if (height <= frozenEdgeHeight) {
                 unfrozenBlocks.remove(height);
+            }
+        }
+
+        // Remove disconnected blocks at or below the new frozen edge.
+        for (long height : new HashSet<>(disconnectedBlocks.keySet())) {
+            if (height <= frozenEdgeHeight) {
+                disconnectedBlocks.remove(height);
             }
         }
 
@@ -289,7 +425,7 @@ public class UnfrozenBlockManager {
         });
     }
 
-    public static synchronized Set<Long> unfrozenBlockHeights() {
+    public static Set<Long> unfrozenBlockHeights() {
 
         return new HashSet<>(unfrozenBlocks.keySet());
     }
@@ -305,7 +441,7 @@ public class UnfrozenBlockManager {
         return number;
     }
 
-    public static synchronized List<Block> allUnfrozenBlocks() {
+    public static List<Block> allUnfrozenBlocks() {
 
         List<Block> allBlocks = new ArrayList<>();
         for (Map<ByteBuffer, Block> blocks : unfrozenBlocks.values()) {
@@ -315,17 +451,38 @@ public class UnfrozenBlockManager {
         return allBlocks;
     }
 
-    public static synchronized List<Block> unfrozenBlocksAtHeight(long height) {
+    public static List<Block> unfrozenBlocksAtHeight(long height) {
 
-        return unfrozenBlocks.containsKey(height) ? new ArrayList<>(unfrozenBlocks.get(height).values()) :
-                new ArrayList<>();
+        Map<ByteBuffer, Block> mapForHeight = unfrozenBlocks.get(height);
+        return mapForHeight == null ? new ArrayList<>() : new ArrayList<>(mapForHeight.values());
     }
 
-    public static synchronized Block unfrozenBlockAtHeight(long height, byte[] hash) {
+    public static Block unfrozenBlockAtHeight(long height, byte[] hash) {
+
+        return blockAtHeight(height, hash, unfrozenBlocks);
+    }
+
+    public static Block unverifiedBlockAtHeight(long height, byte[] hash) {
+
+        // If the unfrozen block is not available, look to the disconnected block map. These blocks, importantly, have
+        // not passed the same level of local vetting at the unfrozen blocks, as we have not yet been able to
+        // independently calculate their balance lists. Care must be exercised to only use this method in situations
+        // where this verifier has fallen behind the cycle and the cycle has already reached consensus on the block
+        // in question.
+
+        Block block = blockAtHeight(height, hash, unfrozenBlocks);
+        if (block == null) {
+            block = blockAtHeight(height, hash, disconnectedBlocks);
+        }
+
+        return block;
+    }
+
+    private static Block blockAtHeight(long height, byte[] hash, Map<Long, Map<ByteBuffer, Block>> blockMap) {
 
         Block block = null;
         if (hash != null) {
-            Map<ByteBuffer, Block> blocksAtHeight = unfrozenBlocks.get(height);
+            Map<ByteBuffer, Block> blocksAtHeight = blockMap.get(height);
             if (blocksAtHeight != null) {
                 block = blocksAtHeight.get(ByteBuffer.wrap(hash));
             }
@@ -334,19 +491,18 @@ public class UnfrozenBlockManager {
         return block;
     }
 
-    public static synchronized void purge() {
+    public static void purge() {
 
         unfrozenBlocks.clear();
     }
 
-    public static synchronized void requestMissingBlocks() {
+    public static void requestMissingBlocks() {
 
         long frozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
         for (long height : BlockVoteManager.getHeights()) {
             if (height == frozenEdgeHeight + 1) {
-
                 for (ByteBuffer hash : BlockVoteManager.getHashesForHeight(height)) {
-                    Block block = UnfrozenBlockManager.unfrozenBlockAtHeight(height, hash.array());
+                    Block block = unfrozenBlockAtHeight(height, hash.array());
                     if (block == null) {
                         fetchMissingBlock(height, hash.array());
                     }
@@ -355,7 +511,7 @@ public class UnfrozenBlockManager {
         }
     }
 
-    public static synchronized void setThresholdOverride(long height, int threshold) {
+    public static void setThresholdOverride(long height, int threshold) {
 
         if (threshold == 0) {
             thresholdOverrides.remove(height);
@@ -364,7 +520,7 @@ public class UnfrozenBlockManager {
         }
     }
 
-    public static synchronized void setHashOverride(long height, byte[] hash) {
+    public static void setHashOverride(long height, byte[] hash) {
 
         if (ByteUtil.isAllZeros(hash)) {
             hashOverrides.remove(height);
@@ -373,13 +529,18 @@ public class UnfrozenBlockManager {
         }
     }
 
-    public static synchronized Map<Long, Integer> getThresholdOverrides() {
+    public static Map<Long, Integer> getThresholdOverrides() {
 
-        return new HashMap<>(thresholdOverrides);
+        return thresholdOverrides;
     }
 
-    public static synchronized Map<Long, byte[]> getHashOverrides() {
+    public static Map<Long, byte[]> getHashOverrides() {
 
-        return new HashMap<>(hashOverrides);
+        return hashOverrides;
+    }
+
+    public static String getVoteDescription() {
+
+        return voteDescription;
     }
 }

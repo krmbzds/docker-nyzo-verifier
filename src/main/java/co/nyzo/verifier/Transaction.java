@@ -1,9 +1,12 @@
 package co.nyzo.verifier;
 
+import co.nyzo.verifier.util.PrintUtil;
 import co.nyzo.verifier.util.SignatureUtil;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Map;
 
 public class Transaction implements MessageObject {
 
@@ -266,6 +269,11 @@ public class Transaction implements MessageObject {
 
     public static Transaction fromByteBuffer(ByteBuffer buffer) {
 
+        return fromByteBuffer(buffer, 0, new byte[FieldByteSize.hash]);
+    }
+
+    public static Transaction fromByteBuffer(ByteBuffer buffer, long transactionHeight, byte[] previousHashInChain) {
+
         // These are the fields contained in all transactions.
         byte type = buffer.get();
         long timestamp = buffer.getLong();
@@ -279,7 +287,8 @@ public class Transaction implements MessageObject {
             transaction = coinGenerationTransaction(timestamp, amount, recipientIdentifier);
         } else if (type == typeSeed || type == typeStandard) {
             long previousHashHeight = buffer.getLong();
-            Block previousHashBlock = BlockManager.frozenBlockForHeight(previousHashHeight);
+            Block previousHashBlock = previousHashBlockForHeight(previousHashHeight, transactionHeight,
+                    previousHashInChain);
             byte[] previousBlockHash = previousHashBlock == null ? new byte[FieldByteSize.hash] :
                     previousHashBlock.getHash();
             byte[] senderIdentifier = new byte[FieldByteSize.identifier];
@@ -305,20 +314,36 @@ public class Transaction implements MessageObject {
         return transaction;
     }
 
+    private static Block previousHashBlockForHeight(long hashHeight, long transactionHeight,
+                                                    byte[] previousHashInChain) {
+
+        // First, try to get a frozen block. If one is not available, and the height referenced is past the frozen edge,
+        // try to get a block on the branch leading to this transaction.
+        Block block = BlockManager.frozenBlockForHeight(hashHeight);
+        if (block == null && hashHeight > BlockManager.getFrozenEdgeHeight()) {
+            Block previousBlock = UnfrozenBlockManager.unverifiedBlockAtHeight(transactionHeight - 1,
+                    previousHashInChain);
+            while (previousBlock != null && previousBlock.getBlockHeight() > hashHeight) {
+                previousBlock = UnfrozenBlockManager.unverifiedBlockAtHeight(previousBlock.getBlockHeight() - 1,
+                        previousBlock.getPreviousBlockHash());
+            }
+
+            if (previousBlock != null && previousBlock.getBlockHeight() == hashHeight) {
+                block = previousBlock;
+            }
+        }
+
+        return block;
+    }
+
     public boolean performInitialValidation(StringBuilder validationError, StringBuilder validationWarning) {
 
         // As its name indicates, this method performs initial validation of transactions so users know when a
-        // transaction will not be queued for block processing. Passing of this validation only enqueues a transaction
-        // and does not
+        // transaction will not be added to the transaction pool. Passing of this validation only adds a transaction
+        // to the pool and does not guarantee that the transaction will be incorporated into a black.
 
-        // A transaction is valid if:
-        // (1) the type is correct
-        // (1) the signature is correct
-        // (2) the transaction amount is at least µ1
-        // (3) the wallet has enough coins to send it (only checked with ValidationType.FinalForBlock)
-        // (4) the previous-block hash is correct
-        // (5) the sender and receiver are different
-        // (6) the block for the specified timestamp is still open for processing
+        // Additionally, to provide good feedback to users, we warn about transactions that will be added to the pool
+        // but appear to have issues that may prevent their incorporation into blocks.
 
         boolean valid = true;
 
@@ -369,11 +394,42 @@ public class Transaction implements MessageObject {
                 }
             }
 
+            // Check the height. If the block has already been frozen, reject the transaction. If the block is already
+            // open for processing, produce a warning.
             if (valid) {
                 long blockHeight = BlockManager.heightForTimestamp(timestamp);
                 long openEdgeHeight = BlockManager.openEdgeHeight(false);
                 if (blockHeight < openEdgeHeight) {
-                    validationError.append("The block has already been processed. ");
+                    if (blockHeight <= BlockManager.getFrozenEdgeHeight()) {
+                        valid = false;
+                        validationError.append("This transaction's block has already been frozen. ");
+                    } else {
+                        validationWarning.append("This transaction's block is already open for processing, so this " +
+                                "transaction may be received too late to be included. ");
+                    }
+                }
+            }
+
+            // Produce a warning for transactions that appear to be balance-list spam.
+            if (valid) {
+                BalanceList balanceList = BalanceListManager.getFrozenEdgeList();
+                if (balanceList != null) {
+                    Map<ByteBuffer, Long> balanceMap = BalanceManager.makeBalanceMap(balanceList);
+                    if (BalanceManager.transactionSpamsBalanceList(balanceMap, this,
+                            Collections.singletonList(this))) {
+
+                        if (getAmount() < BalanceManager.minimumPreferredBalance) {
+                            validationWarning.append("This transaction appears to create a new account with a ")
+                                    .append("balance less than ")
+                                    .append(PrintUtil.printAmount(BalanceManager.minimumPreferredBalance))
+                                    .append(", so it may not be approved. ");
+                        } else {
+                            validationWarning.append("This transaction appears to leave a balance greater than ")
+                                    .append("zero but less than ")
+                                    .append(PrintUtil.printAmount(BalanceManager.minimumPreferredBalance))
+                                    .append(" in the sender account, so it may not be approved. ");
+                        }
+                    }
                 }
             }
 

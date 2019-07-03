@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BlockManager {
 
@@ -16,16 +17,21 @@ public class BlockManager {
     public static final File individualBlockDirectory = new File(blockRootDirectory, "individual");
     private static long trailingEdgeHeight = -1L;
     private static long frozenEdgeHeight = -1L;
+    private static Block frozenEdge = null;
     public static final long blocksPerFile = 1000L;
     private static final long filesPerDirectory = 1000L;
     private static boolean inGenesisCycle = false;
     private static long currentCycleEndHeight = -2L;
     private static List<ByteBuffer> currentCycleList = new ArrayList<>();
-    private static Set<ByteBuffer> currentCycleSet = new HashSet<>();
-    private static Set<ByteBuffer> currentAndNearCycleSet = new HashSet<>();
+    private static Set<ByteBuffer> currentCycleSet = ConcurrentHashMap.newKeySet();
+    private static Set<ByteBuffer> currentAndNearCycleSet = ConcurrentHashMap.newKeySet();
+    private static Set<Node> currentAndNearCycleNodes = ConcurrentHashMap.newKeySet();
     private static long genesisBlockStartTimestamp = -1L;
     private static boolean initialized = false;
     private static boolean cycleComplete = false;
+
+    private static final String lastVerifierRemovalHeightKey = "last_verifier_removal_height";
+    private static long lastVerifierRemovalHeight = PersistentData.getLong(lastVerifierRemovalHeightKey, -1L);
 
     static {
         initialize();
@@ -45,6 +51,11 @@ public class BlockManager {
     public static long getFrozenEdgeHeight() {
 
         return frozenEdgeHeight;
+    }
+
+    public static Block getFrozenEdge() {
+
+        return frozenEdge;
     }
 
     public static long getTrailingEdgeHeight() {
@@ -67,6 +78,11 @@ public class BlockManager {
         // to just behind the trailing edge. Twenty-four blocks gives us 2.8 minutes of leeway.
         long trailingEdgeHeight = getTrailingEdgeHeight();
         return trailingEdgeHeight == -1L ? -1L : Math.max(0, trailingEdgeHeight - 24);
+    }
+
+    public static long getLastVerifierRemovalHeight() {
+
+        return lastVerifierRemovalHeight;
     }
 
     public static Block frozenBlockForHeight(long blockHeight) {
@@ -101,7 +117,7 @@ public class BlockManager {
                 Block previousBlock = null;
                 for (int i = 0; i < numberOfBlocks && (previousBlock == null ||
                         previousBlock.getBlockHeight() < maximumHeight); i++) {
-                    Block block = Block.fromByteBuffer(buffer);
+                    Block block = Block.fromByteBuffer(buffer, false);
                     if (previousBlock == null || (previousBlock.getBlockHeight() != block.getBlockHeight() - 1)) {
                         // Read and discard the balance list.
                         BalanceList.fromByteBuffer(buffer);
@@ -191,7 +207,7 @@ public class BlockManager {
 
         Block previousBlock = frozenBlockForHeight(block.getBlockHeight() - 1);
         if (previousBlock != null) {
-            BalanceList balanceList = BalanceListManager.balanceListForBlock(block, null);
+            BalanceList balanceList = BalanceListManager.balanceListForBlock(block);
             freezeBlock(block, previousBlock.getHash(), balanceList, null);
         }
     }
@@ -204,7 +220,7 @@ public class BlockManager {
 
             try {
                 setFrozenEdge(block, cycleVerifiers);
-                BalanceListManager.registerBalanceList(balanceList);
+                BalanceListManager.updateFrozenEdge(balanceList);
 
                 writeBlocksToFile(Arrays.asList(block), Arrays.asList(balanceList),
                         individualFileForBlockHeight(block.getBlockHeight()));
@@ -301,16 +317,9 @@ public class BlockManager {
                     }
                 }
 
-                // Load the balance lists of the trailing and frozen edges into the balance list manager. This gives us the
-                // balance lists necessary to immediately serve bootstrap response requests.
-                BalanceList trailingEdgeBalanceList = null;
-                for (long height = getTrailingEdgeHeight(); height < getFrozenEdgeHeight() &&
-                        trailingEdgeBalanceList == null; height++) {
-                    trailingEdgeBalanceList = loadBalanceListFromFileForHeight(height);
-                }
+                // Load the balance lists of the frozen edge into the balance list manager.
                 BalanceList frozenEdgeBalanceList = loadBalanceListFromFileForHeight(getFrozenEdgeHeight());
-                BalanceListManager.registerBalanceList(trailingEdgeBalanceList);
-                BalanceListManager.registerBalanceList(frozenEdgeBalanceList);
+                BalanceListManager.updateFrozenEdge(frozenEdgeBalanceList);
 
                 initialized = true;
 
@@ -354,7 +363,7 @@ public class BlockManager {
                 for (int i = 0; i < numberOfBlocks; i++) {
 
                     // Read the block.
-                    Block block = Block.fromByteBuffer(buffer);
+                    Block block = Block.fromByteBuffer(buffer, false);
 
                     // Derive the balance list, if possible. Otherwise, read it.
                     BalanceList balanceList;
@@ -398,7 +407,7 @@ public class BlockManager {
                 Block previousBlock = null;
                 BalanceList balanceList = null;
                 for (int i = 0; i < numberOfBlocks && blockBalanceList == null; i++) {
-                    Block block = Block.fromByteBuffer(buffer);
+                    Block block = Block.fromByteBuffer(buffer, false);
                     if (previousBlock == null || (previousBlock.getBlockHeight() != block.getBlockHeight() - 1)) {
                         balanceList = BalanceList.fromByteBuffer(buffer);
                     } else {
@@ -452,18 +461,21 @@ public class BlockManager {
 
         // Freezing a block under the frozen edge is not allowed.
         if (block.getBlockHeight() < frozenEdgeHeight) {
-            System.err.println("Setting highest block frozen to a lesser value than is currently set.");
+            System.err.println("Attempting to set highest block frozen to a lesser value than is currently set.");
         } else {
             // Set the frozen and trailing edge heights. If the cycle information is null, set the trailing edge to
             // invalid.
+            frozenEdge = block;
             frozenEdgeHeight = block.getBlockHeight();
+            boolean isNewVerifier = false;
             if (block.getCycleInformation() == null) {
                 trailingEdgeHeight = -1L;
             } else {
                 trailingEdgeHeight = Math.max(block.getCycleInformation().getDeterminationHeight(), 0);
+                isNewVerifier = block.getCycleInformation().isNewVerifier();
             }
 
-            updateVerifiersInCurrentCycle(block, cycleVerifiers);
+            updateVerifiersInCurrentCycle(block, cycleVerifiers, isNewVerifier);
         }
 
         // Always add the block to the map. This should be done after the frozen edge is set, because the map looks at
@@ -518,31 +530,32 @@ public class BlockManager {
 
     public static List<ByteBuffer> verifiersInCurrentCycleList() {
 
-        return new ArrayList<>(currentCycleList);
+        return currentCycleList;
     }
 
     public static Set<ByteBuffer> verifiersInCurrentCycleSet() {
 
-        return new HashSet<>(currentCycleSet);
+        return currentCycleSet;
     }
 
-    public static Set<ByteBuffer> verifiersInCurrentAndNearCycleSet() {
+    public static Set<Node> getCurrentAndNearCycleNodes() {
 
-        return new HashSet<>(currentAndNearCycleSet);
+        return currentAndNearCycleNodes;
     }
 
     public static boolean verifierInCurrentCycle(ByteBuffer identifier) {
 
-        return currentCycleSet.contains(identifier);
+        return BlockManager.inGenesisCycle() || currentCycleSet.contains(identifier);
     }
 
     public static boolean verifierInOrNearCurrentCycle(ByteBuffer identifier) {
 
-        return currentAndNearCycleSet.contains(identifier);
+        return BlockManager.inGenesisCycle() || currentAndNearCycleSet.contains(identifier);
     }
 
     private static synchronized void updateVerifiersInCurrentCycle(Block block,
-                                                                   List<ByteBuffer> bootstrapCycleVerifiers) {
+                                                                   List<ByteBuffer> bootstrapCycleVerifiers,
+                                                                   boolean isNewVerifier) {
 
         // Store this now before we step back in the chain.
         ByteBuffer edgeIdentifierBuffer = ByteBuffer.wrap(block.getVerifierIdentifier());
@@ -596,10 +609,8 @@ public class BlockManager {
             if (alternateCycleList == null) {
                 // Both calculations failed.
                 cycleComplete = false;
-                System.out.println("*** both calculations failed for block " + edgeHeight + " ***");
             } else {
                 // The alternate calculation succeeded.
-                System.out.println("*** using alternate calculation for block " + edgeHeight + " ***");
                 currentCycleList = alternateCycleList;
                 cycleComplete = true;
             }
@@ -609,14 +620,39 @@ public class BlockManager {
         }
 
         if (cycleComplete) {
+
+            // If a verifier was dropped from the cycle, store the height. This is used to determine whether to
+            // penalize poorly performing verifiers, as we do not want to drop verifiers from the cycle too quickly.
+            if (currentCycleList.size() < BlockManager.currentCycleList.size() ||
+                    (currentCycleList.size() == BlockManager.currentCycleList.size() && isNewVerifier)) {
+                lastVerifierRemovalHeight = edgeHeight;
+                PersistentData.put(lastVerifierRemovalHeightKey, lastVerifierRemovalHeight);
+            }
+
+            // Store the edge height, cycle list, and indication of Genesis cycle.
             BlockManager.currentCycleEndHeight = edgeHeight;
             BlockManager.currentCycleList = currentCycleList;
-            BlockManager.currentCycleSet = new HashSet<>(currentCycleList);
             BlockManager.inGenesisCycle = inGenesisCycle;
 
-            Set<ByteBuffer> currentAndNearCycleSet = new HashSet<>(currentCycleList);
+            // Build the cycle set.
+            Set<ByteBuffer> currentCycleSet = ConcurrentHashMap.newKeySet();
+            currentCycleSet.addAll(currentCycleList);
+            BlockManager.currentCycleSet = currentCycleSet;
+
+            // Build the cycle-and-near set.
+            Set<ByteBuffer> currentAndNearCycleSet = ConcurrentHashMap.newKeySet();
+            currentAndNearCycleSet.addAll(currentCycleList);
             currentAndNearCycleSet.addAll(NewVerifierVoteManager.topVerifiers());
             BlockManager.currentAndNearCycleSet = currentAndNearCycleSet;
+
+            // Build the cycle-and-near node set.
+            Set<Node> currentAndNearCycleNodes = ConcurrentHashMap.newKeySet();
+            for (Node node : NodeManager.getMesh()) {
+                if (currentAndNearCycleSet.contains(ByteBuffer.wrap(node.getIdentifier()))) {
+                    currentAndNearCycleNodes.add(node);
+                }
+            }
+            BlockManager.currentAndNearCycleNodes = currentAndNearCycleNodes;
         }
     }
 

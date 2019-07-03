@@ -1,7 +1,11 @@
 package co.nyzo.verifier;
 
 import co.nyzo.verifier.messages.*;
+import co.nyzo.verifier.nyzoString.NyzoStringEncoder;
+import co.nyzo.verifier.nyzoString.NyzoStringPrivateSeed;
+import co.nyzo.verifier.nyzoString.NyzoStringPublicIdentifier;
 import co.nyzo.verifier.util.*;
+import co.nyzo.verifier.web.WebListener;
 
 import java.io.File;
 import java.lang.reflect.Method;
@@ -24,12 +28,14 @@ public class Verifier {
     private static final AtomicBoolean alive = new AtomicBoolean(false);
     private static byte[] privateSeed = null;
     private static String nickname = null;
-    private static int rejoinCount = 0;
 
     private static int numberOfBlocksCreated = 0;
     private static int numberOfBlocksTransmitted = 0;
 
     private static long lastBlockFrozenTimestamp = 0;
+
+    private static final long blockWithVotesRequestInterval = 2000L;  // 2 seconds
+    private static long lastBlockWithVotesRequestTimestamp = 0L;
 
     private static int recentMessageTimestampsIndex = 0;
     private static final long[] recentMessageTimestamps = new long[10];
@@ -38,11 +44,7 @@ public class Verifier {
     private static final Map<ByteBuffer, Block> blocksCreated = new HashMap<>();
     private static final Map<ByteBuffer, Block> blocksTransmitted = new HashMap<>();
 
-    private static int blockWithVotesMessageSupportedCount = 0;
-    private static int blockWithVotesMessageUnsupportedCount = 0;
-    private static int blockLegacyMessageCount = 0;
-
-    private static boolean paused = false;
+    private static long initializationTime = 0L;
 
     static {
         // This ensures the seed is always available, even if this class is used from a test script.
@@ -68,10 +70,11 @@ public class Verifier {
                 System.out.println("fin.");
             } catch (Exception e) {
 
-                System.out.println("unable to load class " + args[0]);
+                System.out.println("unable to load class " + args[0] + ", exception: " + PrintUtil.printException(e));
             }
 
         } else {
+            RunMode.setRunMode(RunMode.Verifier);
             start();
         }
     }
@@ -86,10 +89,9 @@ public class Verifier {
 
         if (privateSeed == null) {
             final Path seedFile = Paths.get(dataRootDirectory.getAbsolutePath() + "/verifier_private_seed");
-            System.out.println("seed file path is " + seedFile);
             try {
                 List<String> lines = Files.readAllLines(seedFile);
-                if (lines != null && !lines.isEmpty()) {
+                if (!lines.isEmpty()) {
                     String line = lines.get(0);
                     if (line.length() > 64) {
                         privateSeed = ByteUtil.byteArrayFromHexString(lines.get(0), 32);
@@ -106,11 +108,24 @@ public class Verifier {
                     privateSeed = null;
                 }
             }
+
+            // Write the information file with the Nyzo strings. These are typed, error-protected encodings of the
+            // private seed and public identifier.
+            if (privateSeed != null) {
+                NyzoStringPrivateSeed privateSeedString = new NyzoStringPrivateSeed(privateSeed);
+                byte[] publicIdentifier = KeyUtil.identifierForSeed(privateSeed);
+                NyzoStringPublicIdentifier publicIdentifierString = new NyzoStringPublicIdentifier(publicIdentifier);
+
+                Path informationFilePath = Paths.get(dataRootDirectory.getAbsolutePath() + "/verifier_info");
+                FileUtil.writeFile(informationFilePath, Arrays.asList(NyzoStringEncoder.encode(privateSeedString),
+                        NyzoStringEncoder.encode(publicIdentifierString)));
+            }
         }
     }
 
     public static void start() {
 
+        long startTimestamp = System.currentTimeMillis();
         if (!alive.getAndSet(true)) {
 
             // Load the private seed. This seed is used to sign all messages, so this is done first.
@@ -124,10 +139,6 @@ public class Verifier {
             try {
                 Thread.sleep(20L);
             } catch (Exception ignored) { }
-
-            // Update the mesh limit. We need to have this before we start calculating scores for blocks.
-            System.out.println("updating mesh limit");
-            NewVerifierVoteManager.updateMeshLimit();
 
             // Ensure that the Genesis block is loaded.
             System.out.println("loading genesis block");
@@ -160,109 +171,69 @@ public class Verifier {
             }
 
             // Send mesh requests to all trusted entry points.
-            Message meshRequest = new Message(MessageType.MeshRequest15, null);
+            AtomicInteger numberOfMeshResponsesPending = new AtomicInteger(trustedEntryPoints.size());
             for (TrustedEntryPoint entryPoint : trustedEntryPoints) {
-                Message.fetch(entryPoint.getHost(), entryPoint.getPort(), meshRequest, new MessageCallback() {
-                    @Override
-                    public void responseReceived(Message message) {
-
-                        // Send node-join requests to all nodes in the response.
-                        MeshResponse response = (MeshResponse) message.getContent();
-                        for (Node node : response.getMesh()) {
-                            NodeManager.sendNodeJoinMessage(node.getIpAddress(), node.getPort());
-                        }
-                    }
-                });
+                fetchMesh(entryPoint, numberOfMeshResponsesPending);
+                sendNodeJoinMessage(entryPoint);
             }
 
-            // Wait two seconds for the node-join requests to reach other nodes so we start receiving blocks.
-            try {
-                Thread.sleep(2000L);
-            } catch (Exception ignored) {
+            // Wait up to two seconds for the mesh responses to return.
+            long meshResponseWaitTime = 0L;
+            for (int i = 0; i < 10 && numberOfMeshResponsesPending.get() > 0; i++) {
+                ThreadUtil.sleep(200L);
+                meshResponseWaitTime += 200L;
             }
+            System.out.println(String.format("%d mesh responses pending after %.1f wait",
+                    numberOfMeshResponsesPending.get(), meshResponseWaitTime / 1000.0));
 
-            // Only continue with the edge-initialization process if we might need to fetch a new frozen edge. If the
-            // open edge is fewer than 20 blocks ahead of the local frozen edge, and we have a complete cycle in the
-            // block manager, we can treat the restart as a temporary outage and use standard recovery mechanisms.
-            long openEdgeHeight = BlockManager.openEdgeHeight(false);
-            if (BlockManager.isCycleComplete() && openEdgeHeight < BlockManager.getFrozenEdgeHeight() + 20) {
-                System.out.println("skipping frozen-edge consensus process due to short downtime and complete cycle");
-            } else {
+            // Instruct the node manager to send the node-join messages. The queue is based on IP address, so deduping
+            // naturally occurs and only one request is typically sent to each node at this point. The -1 value tells
+            // the node manager to empty the queue.
+            NodeManager.sendNodeJoinRequests(-1);
 
-                System.out.println("entering frozen-edge consensus process because open edge, " + openEdgeHeight +
-                        ", is " + (openEdgeHeight - BlockManager.getFrozenEdgeHeight()) + " past frozen edge, " +
-                        BlockManager.getFrozenEdgeHeight() + " and cycleComplete=" + BlockManager.isCycleComplete());
+            ChainInitializationManager.initializeFrozenEdge(trustedEntryPoints);
 
-                // Attempt to jump into the blockchain. This should succeed on the first attempt, but it may take
-                // longer if we are starting a new mesh.
-                BootstrapResponseV2 consensusBootstrapResponse = null;
-                while (consensusBootstrapResponse == null && !UpdateUtil.shouldTerminate()) {
+            // In order to process efficiently, we need to be well-connected to the cycle. If there are slow-downs that
+            // have prevented connection to this point, they should be addressed before entering the main verifier loop.
+            // We set 75% of the current cycle as a threshold, as it is the minimum required for automatic consensus.
+            NodeManager.sendNodeJoinRequests(-1);
+            NodeManager.updateActiveVerifiersAndRemoveOldNodes();
+            int meshRequestIndex = 0;
+            while (NodeManager.getNumberOfActiveCycleIdentifiers() < BlockManager.currentCycleLength() * 3 / 4) {
+                System.out.println(String.format("entering supplemental connection process because only %d in-cycle " +
+                        "connections have been made for a cycle size of %d (%.1f%%)",
+                        NodeManager.getNumberOfActiveCycleIdentifiers(), BlockManager.currentCycleLength(),
+                        NodeManager.getNumberOfActiveCycleIdentifiers() * 100.0 / BlockManager.currentCycleLength()));
+                System.out.println("missing in-cycle verifiers: " + NodeManager.getMissingInCycleVerifiers());
 
-                    // Wait for the incoming message queue to clear. This will prevent a potential problem where this
-                    // loop continues to pile on more and more requests while not getting responses in time because the
-                    // queue is overfilled.
-                    MessageQueue.blockThisThreadUntilClear();
+                // Fetch the mesh from one trusted entry point.
+                numberOfMeshResponsesPending = new AtomicInteger(1);
+                fetchMesh(trustedEntryPoints.get(meshRequestIndex), numberOfMeshResponsesPending);
+                meshRequestIndex = (meshRequestIndex + 1) % trustedEntryPoints.size();
 
-                    AtomicInteger numberOfResponsesReceived = new AtomicInteger(0);
-
-                    // Send bootstrap requests to all trusted entry points.
-                    Message bootstrapRequest = new Message(MessageType.BootstrapRequestV2_35,
-                            new BootstrapRequest(MeshListener.getPort()));
-                    for (TrustedEntryPoint entryPoint : trustedEntryPoints) {
-
-                        System.out.println("sending Bootstrap request to " + entryPoint);
-                        Message.fetch(entryPoint.getHost(), entryPoint.getPort(), bootstrapRequest,
-                                new MessageCallback() {
-                                    @Override
-                                    public void responseReceived(Message message) {
-                                        if (message == null) {
-                                            System.out.println("Bootstrap response is null");
-                                        } else {
-                                            numberOfResponsesReceived.incrementAndGet();
-                                            ChainInitializationManager.processBootstrapResponseMessage(message);
-                                        }
-                                    }
-                                });
-                    }
-
-                    // Wait up to 20 seconds for requests to return.
-                    try {
-                        for (int i = 0; i < 20 && numberOfResponsesReceived.get() < trustedEntryPoints.size(); i++) {
-                            Thread.sleep(1000L);
-                        }
-                    } catch (Exception ignored) {
-                    }
-
-                    // Get the consensus response. If this can be determined, we can move to the next step.
-                    consensusBootstrapResponse = ChainInitializationManager.winningResponse();
-                    System.out.println("consensus bootstrap response: " + consensusBootstrapResponse);
+                // Wait up to two seconds for the mesh response to return.
+                for (int i = 0; i < 10 && numberOfMeshResponsesPending.get() > 0; i++) {
+                    ThreadUtil.sleep(200L);
                 }
 
-                // If the consensus frozen edge is more than 20 past the local frozen edge, and we are not in the cycle,
-                // fetch the consensus frozen edge. If the consensus frozen edge is more than the cycle length past the
-                // frozen edge, it does not matter if we were in the cycle. We have lost our place, and the frozen edge
-                // needs to be fetched. If we do not fetch the frozen edge here, the recovery mechanisms will attempt to
-                // catch us back up in time to verify a block.
-                if (consensusBootstrapResponse != null) {
+                // Clear the node-join request queue. Then, sleep one second to allow more requests to return, and wait
+                // until the message queue has cleared. Finally, before the loop condition is checked again, update the
+                // active verifiers to reflect any that have been added since the last iteration.
+                NodeManager.sendNodeJoinRequests(-1);
+                ThreadUtil.sleep(1000L);
+                MessageQueue.blockThisThreadUntilClear();
 
-                    long consensusFrozenEdge = consensusBootstrapResponse.getFrozenEdgeHeight();
-                    boolean fetchRequiredNotInCycle = consensusFrozenEdge > BlockManager.getFrozenEdgeHeight() + 20 &&
-                            !inCycle();
-                    boolean fetchRequiredInCycle = consensusFrozenEdge > BlockManager.getFrozenEdgeHeight() +
-                            BlockManager.currentCycleLength();
-
-                    System.out.println("local frozen edge: " + BlockManager.getFrozenEdgeHeight() +
-                            ", consensus frozen edge: " + consensusFrozenEdge + ", fetch required (not-in-cycle): " +
-                            fetchRequiredNotInCycle + ", fetch required (in-cycle): " + fetchRequiredInCycle);
-
-                    if (fetchRequiredNotInCycle || fetchRequiredInCycle || !BlockManager.isCycleComplete()) {
-                        System.out.println("fetching block based on bootstrap response");
-                        ChainInitializationManager.fetchBlock(consensusBootstrapResponse);
-                    }
-                }
+                NodeManager.updateActiveVerifiersAndRemoveOldNodes();
             }
 
-            System.out.println("ready to start thread for main verifier loop");
+            // If the preference is set, start the web listener.
+            if (PreferencesUtil.getBoolean(WebListener.startWebListenerKey, false)) {
+                WebListener.start();
+            }
+
+            initializationTime = System.currentTimeMillis() - startTimestamp;
+            System.out.println("ready to start thread for main verifier loop, initialization time=" +
+                    initializationTime);
 
             // Start the proactive side of the verifier, initiating the actions necessary to maintain the mesh and
             // build the blockchain.
@@ -281,6 +252,53 @@ public class Verifier {
                 }
             }, "Verifier-mainLoop").start();
         }
+    }
+
+    private static void fetchMesh(TrustedEntryPoint entryPoint, AtomicInteger numberOfMeshResponsesPending) {
+
+        Message meshRequest = new Message(MessageType.MeshRequest15, null);
+        Message.fetchTcp(entryPoint.getHost(), entryPoint.getPort(), meshRequest, new MessageCallback() {
+            @Override
+            public void responseReceived(Message message) {
+
+                // Enqueue node-join requests for all nodes in the response.
+                MeshResponse response = (MeshResponse) message.getContent();
+                for (Node node : response.getMesh()) {
+                    NodeManager.enqueueNodeJoinMessage(node.getIpAddress(), node.getPortTcp());
+                }
+
+                numberOfMeshResponsesPending.decrementAndGet();
+            }
+        });
+    }
+
+    private static void sendNodeJoinMessage(TrustedEntryPoint trustedEntryPoint) {
+
+        System.out.println("sending node-join messages to trusted entry point: " + trustedEntryPoint);
+
+        Message message = new Message(MessageType.NodeJoin3, new NodeJoinMessage());
+        Message.fetchTcp(trustedEntryPoint.getHost(), trustedEntryPoint.getPort(), message,
+                new MessageCallback() {
+                    @Override
+                    public void responseReceived(Message message) {
+                        if (message != null) {
+
+                            NodeManager.updateNode(message);
+
+                            NodeJoinResponse response = (NodeJoinResponse) message.getContent();
+                            if (response != null) {
+
+                                NicknameManager.put(message.getSourceNodeIdentifier(),
+                                        response.getNickname());
+
+                                if (!ByteUtil.isAllZeros(response.getNewVerifierVote().getIdentifier())) {
+                                    NewVerifierVoteManager.registerVote(message.getSourceNodeIdentifier(),
+                                            response.getNewVerifierVote(), false);
+                                }
+                            }
+                        }
+                    }
+                });
     }
 
     public static void loadGenesisBlock() {
@@ -312,13 +330,13 @@ public class Verifier {
                 } catch (Exception ignored) {
                 }
             } else {
-                BalanceList balanceList = BalanceListManager.balanceListForBlock(genesisBlock, null);
+                BalanceList balanceList = BalanceListManager.balanceListForBlock(genesisBlock);
                 BlockManager.freezeBlock(genesisBlock, genesisBlock.getPreviousBlockHash(), balanceList, null);
             }
         }
     }
 
-    private static List<TrustedEntryPoint> getTrustedEntryPoints() {
+    public static List<TrustedEntryPoint> getTrustedEntryPoints() {
 
         Path path = Paths.get(dataRootDirectory.getAbsolutePath() + "/trusted_entry_points");
         List<TrustedEntryPoint> entryPoints = new ArrayList<>();
@@ -348,10 +366,10 @@ public class Verifier {
 
             MessageQueue.blockThisThreadUntilClear();
 
-            long sleepTime = 1000L;
+            long sleepTime = 300L;
             try {
                 // Only run the active verifier if connected to the mesh.
-                if (NodeManager.connectedToMesh() && !paused) {
+                if (NodeManager.connectedToMesh()) {
 
                     // Perform setup tasks for the NodeManager.
                     NodeManager.updateActiveVerifiersAndRemoveOldNodes();
@@ -415,18 +433,23 @@ public class Verifier {
                     // Attempt to register any blocks that were previously disconnected.
                     UnfrozenBlockManager.attemptToRegisterDisconnectedBlocks();
 
-                    // Try to freeze a block.
-                    UnfrozenBlockManager.attemptToFreezeBlock();
+                    // Try to freeze blocks.
+                    boolean frozeBlock = UnfrozenBlockManager.attemptToFreezeBlock();
+                    if (!frozeBlock) {
+                        UnfrozenBlockManager.attemptToFreezeChain();
+                    }
 
-                    // Remove old votes from the block vote manager.
+                    // Remove old votes from the vote managers.
                     BlockVoteManager.removeOldVotes();
+                    NewVerifierVoteManager.removeOldVotes();
+                    VerifierRemovalManager.removeOldVotes();
 
                     // Vote requests and block requests should only happen if this verifier is in the cycle. Otherwise,
                     // other verifiers might blacklist this verifier.
                     if (inCycle()) {
 
-                        // Request any votes that appear to be missing.
-                        BlockVoteManager.requestMissingVotes();
+                        // Request any frozen blocks that appear to be missing.
+                        BlockVoteManager.requestMissingFrozenBlocks();
 
                         // Request any blocks that appear to be missing.
                         UnfrozenBlockManager.requestMissingBlocks();
@@ -435,32 +458,43 @@ public class Verifier {
                         // In-cycle verifiers do not allow other verifiers to request missing blocks or votes, as they
                         // would use considerable bandwidth to service such requests. Instead, they provide frozen
                         // blocks bundled with votes in a single message.
-
-                        // To cover the interim period when a large portion of the mesh does not support the new
-                        // block-with-votes message, this verifier will use the old block message to keep up with the
-                        // frozen edge if the new message is not allowing it to keep up. This switch will be removed
-                        // in the next version, leaving only requestBlockWithVotes() here.
-
-                        StatusResponse.setField("S/U/L", blockWithVotesMessageSupportedCount + "/" +
-                                blockWithVotesMessageUnsupportedCount + "/" + blockLegacyMessageCount);
-
-                        if (blockWithVotesMessageSupportedCount + blockLegacyMessageCount >
-                                blockWithVotesMessageUnsupportedCount) {
-                            requestBlockWithVotes();
-                        } else {
-                            blockLegacyMessageCount++;
-                            requestBlockWithoutVotes();
-                        }
+                        requestBlockWithVotes();
                     }
 
                     // These are operations that only have to happen when a block is frozen.
-                    if (frozenEdgeHeight != BlockManager.getFrozenEdgeHeight()) {
+                    long newFrozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
+                    if (frozenEdgeHeight != newFrozenEdgeHeight) {
 
-                        System.out.println("cleaning up because a block was frozen");
+                        System.out.println("cleaning up because block " + newFrozenEdgeHeight + " was frozen");
 
-                        // Request any nodes that appear to be missing. This is called only when an edge is frozen, and
-                        // the node manager maintains a counter to ensure it is only performed once per cycle.
-                        NodeManager.requestMissingNodes();
+                        // If this verifier has not yet cast a vote for the height that was just frozen, cast it now
+                        // to show that this verifier is actively participating in the mesh and to fortify the
+                        // block-with-votes responses.
+                        Block newFrozenEdge = BlockManager.frozenBlockForHeight(newFrozenEdgeHeight);
+                        if (newFrozenEdge != null &&
+                                BlockVoteManager.getLocalVoteForHeight(newFrozenEdgeHeight) == null) {
+                            System.out.println("casting late vote for height " + newFrozenEdgeHeight);
+                            UnfrozenBlockManager.castVote(newFrozenEdge.getBlockHeight(), newFrozenEdge.getHash());
+                        }
+
+                        // Request the mesh. This is called only when an edge is frozen, and the node manager maintains
+                        // a counter to ensure it is only performed once per cycle.
+                        NodeManager.requestMesh();
+
+                        // Send up to 10 node-join requests. Previously, these were all sent when the mesh was
+                        // requested. Now, they are enqueued and sent a few at a time to reduce the spike in network
+                        // activity.
+                        NodeManager.sendNodeJoinRequests(10);
+
+                        // Update scores with the verifier performance manager and send votes.
+                        long scoreUpdateHeight = newFrozenEdgeHeight - 1;
+                        Block scoreUpdateBlock = BlockManager.frozenBlockForHeight(scoreUpdateHeight);
+                        VerifierPerformanceManager.updateScoresForFrozenBlock(scoreUpdateBlock,
+                                BlockVoteManager.votesForHeight(scoreUpdateHeight));
+                        VerifierPerformanceManager.sendVotes();
+
+                        // Update vote counts for verifier removal.
+                        VerifierRemovalManager.updateVoteCounts();
 
                         // Perform blacklist and unfrozen block maintenance.
                         BlacklistManager.performMaintenance();
@@ -473,18 +507,12 @@ public class Verifier {
                         // Clean old transactions from the transaction pool.
                         TransactionPool.updateFrozenEdge();
 
-                        // Update the mesh limit every 10 blocks. This is something that does not need to happen
-                        // often.
-                        if (BlockManager.getFrozenEdgeHeight() % 10 == 0) {
-                            NewVerifierVoteManager.updateMeshLimit();
-                        }
-
                         // Every 100 blocks, demote all in-cycle nodes and write the queue timestamps to disk. This
                         // should be done infrequently, as it involves file access, and it does not need to happen
                         // frequently to be effective.
                         if (BlockManager.getFrozenEdgeHeight() % 100 == 0) {
                             NodeManager.demoteInCycleNodes();
-                            NodeManager.persistQueueTimestamps();
+                            NodeManager.persistNodes();
                         }
 
                         // Store the timestamp of when the block was frozen. This is used for determining when to
@@ -558,13 +586,24 @@ public class Verifier {
             List<Transaction> approvedTransactions = BalanceManager.approvedTransactionsForBlock(transactions,
                     previousBlock);
 
-            BalanceList previousBalanceList = BalanceListManager.balanceListForBlock(previousBlock, null);
-            BalanceList balanceList = Block.balanceListForNextBlock(previousBlock, previousBalanceList,
-                    approvedTransactions, Verifier.getIdentifier());
-            if (balanceList != null) {
-                long startTimestamp = BlockManager.startTimestampForHeight(blockHeight);
-                block = new Block(blockHeight, previousBlock.getHash(), startTimestamp, approvedTransactions,
-                        balanceList.getHash());
+            BalanceList previousBalanceList = BalanceListManager.balanceListForBlock(previousBlock);
+            if (previousBalanceList != null) {
+
+                // Remove any balance-list spam transactions. To avoid rejection of incoming blocks, these
+                // transactions are not currently removed from those blocks, but they are removed from blocks
+                // produced locally.
+                Map<ByteBuffer, Long> balanceMap = BalanceManager.makeBalanceMap(previousBalanceList);
+                approvedTransactions = BalanceManager.transactionsWithoutBalanceListSpam(balanceMap,
+                        approvedTransactions);
+
+                // Make the balance list for the new block. If the balance list is good, make the block.
+                BalanceList balanceList = Block.balanceListForNextBlock(previousBlock, previousBalanceList,
+                        approvedTransactions, Verifier.getIdentifier());
+                if (balanceList != null) {
+                    long startTimestamp = BlockManager.startTimestampForHeight(blockHeight);
+                    block = new Block(blockHeight, previousBlock.getHash(), startTimestamp, approvedTransactions,
+                            balanceList.getHash());
+                }
             }
         }
 
@@ -642,14 +681,6 @@ public class Verifier {
         return numberOfBlocksTransmitted + "/" + numberOfBlocksCreated;
     }
 
-    public static boolean isPaused() {
-        return paused;
-    }
-
-    public static void setPaused(boolean paused) {
-        Verifier.paused = paused;
-    }
-
     public static long getLastBlockFrozenTimestamp() {
 
         return lastBlockFrozenTimestamp;
@@ -660,29 +691,23 @@ public class Verifier {
         return BlockManager.verifierInCurrentCycle(ByteBuffer.wrap(getIdentifier()));
     }
 
-    public static int getRejoinCount() {
-
-        return rejoinCount;
-    }
-
     private static void requestBlockWithVotes() {
 
         long frozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
-        if (BlockManager.openEdgeHeight(false) > frozenEdgeHeight + 2) {
+        if (BlockManager.openEdgeHeight(false) > frozenEdgeHeight + 2 &&
+                System.currentTimeMillis() > lastBlockWithVotesRequestTimestamp + blockWithVotesRequestInterval) {
+
+            long interval = System.currentTimeMillis() - lastBlockWithVotesRequestTimestamp;
+            lastBlockWithVotesRequestTimestamp = System.currentTimeMillis();
 
             long heightToRequest = frozenEdgeHeight + 1L;
-            System.out.println("requesting block with votes for height " + heightToRequest);
+            System.out.println("requesting block with votes for height " + heightToRequest + ", interval=" +
+                    interval);
             BlockWithVotesRequest request = new BlockWithVotesRequest(heightToRequest);
             Message message = new Message(MessageType.BlockWithVotesRequest37, request);
             Message.fetchFromRandomNode(message, new MessageCallback() {
                 @Override
                 public void responseReceived(Message message) {
-
-                    if (message != null && message.getType() == MessageType.BlockWithVotesResponse38) {
-                        blockWithVotesMessageSupportedCount++;
-                    } else {
-                        blockWithVotesMessageUnsupportedCount++;
-                    }
 
                     BlockWithVotesResponse response = message == null ? null :
                             (BlockWithVotesResponse) message.getContent();
@@ -699,8 +724,6 @@ public class Verifier {
                                     new byte[FieldByteSize.ipAddress]);
                             if (voteMessage.isValid()) {
                                 BlockVoteManager.registerVote(voteMessage);
-                            } else {
-                                System.out.println("vote is ***NOT VALID***");
                             }
                         }
                     }
@@ -709,39 +732,4 @@ public class Verifier {
         }
     }
 
-    private static void requestBlockWithoutVotes() {
-
-        long frozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
-        if (BlockManager.openEdgeHeight(false) > frozenEdgeHeight + 2) {
-
-            AtomicBoolean processedResponse = new AtomicBoolean(false);
-
-            long heightToRequest = frozenEdgeHeight + 1;
-            System.out.println("requesting block from trusted source for height " + heightToRequest);
-            Message message = new Message(MessageType.BlockRequest11, new BlockRequest(heightToRequest, heightToRequest,
-                    false));
-            Message.fetchFromRandomNode(message, new MessageCallback() {
-                @Override
-                public void responseReceived(Message message) {
-
-                    if (message != null) {
-                        BlockResponse response = (BlockResponse) message.getContent();
-                        if (response != null && response.getBlocks().size() == 1) {
-
-                            Block block = response.getBlocks().get(0);
-                            BlockManager.freezeBlock(block);
-                        }
-                    }
-
-                    processedResponse.set(true);
-                }
-            });
-
-            while (!processedResponse.get()) {
-                try {
-                    Thread.sleep(200L);
-                } catch (Exception ignored) { }
-            }
-        }
-    }
 }

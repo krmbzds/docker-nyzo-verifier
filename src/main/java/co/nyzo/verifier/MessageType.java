@@ -28,8 +28,8 @@ public enum MessageType {
     BlockVoteResponse20(20),
     NewVerifierVote21(21),
     NewVerifierVoteResponse22(22),
-    MissingBlockVoteRequest23(23),
-    MissingBlockVoteResponse24(24),
+    MissingBlockVoteRequest23(23),   // no longer used as of v515; will be eliminated in a future version
+    MissingBlockVoteResponse24(24),  // no longer used as of v515; will be eliminated in a future version
     MissingBlockRequest25(25),
     MissingBlockResponse26(26),
     TimestampRequest27(27),
@@ -44,6 +44,14 @@ public enum MessageType {
     BootstrapResponseV2_36(36),
     BlockWithVotesRequest37(37),
     BlockWithVotesResponse38(38),
+    VerifierRemovalVote39(39),
+    VerifierRemovalVoteResponse40(40),
+    FullMeshRequest41(41),
+    FullMeshResponse42(42),
+    NodeJoinV2_43(43),
+    NodeJoinResponseV2_44(44),
+    FrozenEdgeBalanceListRequest_45(45),
+    FrozenEdgeBalanceListResponse_46(46),
 
     // test messages
     Ping200(200),
@@ -73,9 +81,13 @@ public enum MessageType {
     NewVerifierTallyStatusResponse415(415),
     BlacklistStatusRequest416(416),
     BlacklistStatusResponse417(417),
+    PerformanceScoreStatusRequest418(418),
+    PerformanceScoreStatusResponse419(419),
+    VerifierRemovalTallyStatusRequest420(420),
+    VerifierRemovalTallyStatusResponse421(421),
 
     // bootstrapping messages
-    ResetRequest500(500),   // resets the blockchain   TODO: key this to the local verifier before release
+    ResetRequest500(500),   // resets the blockchain
     ResetResponse501(501),
 
     // the highest allowable message number is 65535

@@ -82,13 +82,13 @@ public class Block implements MessageObject {
 
     public Block(long height, byte[] previousBlockHash, long startTimestamp, long verificationTimestamp,
                   List<Transaction> transactions, byte[] balanceListHash, byte[] verifierIdentifier,
-                  byte[] verifierSignature) {
+                  byte[] verifierSignature, boolean validateTransactions) {
 
         this.height = height;
         this.previousBlockHash = previousBlockHash;
         this.startTimestamp = startTimestamp;
         this.verificationTimestamp = verificationTimestamp;
-        this.transactions = validTransactions(transactions, startTimestamp);
+        this.transactions = validateTransactions ? validTransactions(transactions, startTimestamp) : transactions;
         this.balanceListHash = balanceListHash;
         this.verifierIdentifier = verifierIdentifier;
         this.verifierSignature = verifierSignature;
@@ -272,7 +272,7 @@ public class Block implements MessageObject {
             identifiers.add(identifier);
 
             // This is the special case when we reach the Genesis block.
-            if (blockToCheck.getBlockHeight() == 0) {
+            if (blockToCheck.getBlockHeight() == 0 && primaryCycleIndex < 4) {
 
                 reachedGenesisBlock = true;
 
@@ -286,8 +286,7 @@ public class Block implements MessageObject {
                 if (primaryCycleIndex == 0) {
                     inGenesisCycle = true;
                     newVerifier = true;
-                } else if (primaryCycleIndex < 3 ||
-                        (primaryCycleIndex < 4 && cycleEndHeight != primaryCycleEndHeight)) {
+                } else if (primaryCycleIndex < 3 || cycleEndHeight != primaryCycleEndHeight) {
                     maximumCycleLength = Math.max(maximumCycleLength, orderedIdentifiers.size());
                 }
             }
@@ -446,6 +445,11 @@ public class Block implements MessageObject {
 
     public static Block fromByteBuffer(ByteBuffer buffer) {
 
+        return fromByteBuffer(buffer, true);
+    }
+
+    public static Block fromByteBuffer(ByteBuffer buffer, boolean validateTransactions) {
+
         long blockHeight = buffer.getLong();
         byte[] previousBlockHash = new byte[FieldByteSize.hash];
         buffer.get(previousBlockHash);
@@ -454,7 +458,7 @@ public class Block implements MessageObject {
         int numberOfTransactions = buffer.getInt();
         List<Transaction> transactions = new ArrayList<>();
         for (int i = 0; i < numberOfTransactions; i++) {
-            transactions.add(Transaction.fromByteBuffer(buffer));
+            transactions.add(Transaction.fromByteBuffer(buffer, blockHeight, previousBlockHash));
         }
 
         byte[] balanceListHash = new byte[FieldByteSize.hash];
@@ -465,7 +469,7 @@ public class Block implements MessageObject {
         buffer.get(verifierSignature);
 
         return new Block(blockHeight, previousBlockHash, startTimestamp, verificationTimestamp, transactions,
-                balanceListHash, verifierIdentifier, verifierSignature);
+                balanceListHash, verifierIdentifier, verifierSignature, validateTransactions);
     }
 
     public static BalanceList balanceListForNextBlock(Block previousBlock, BalanceList previousBalanceList,
@@ -505,6 +509,13 @@ public class Block implements MessageObject {
                 Map<ByteBuffer, BalanceListItem> identifierToItemMap = new HashMap<>();
                 for (BalanceListItem item : previousBalanceItems) {
                     identifierToItemMap.put(ByteBuffer.wrap(item.getIdentifier()), item);
+                }
+
+                // Remove any invalid transactions. The previous block is only null for the Genesis block. This also
+                // only needs to be performed on blocks past the frozen edge, as blocks that have been frozen are no
+                // longer subject to scrutiny.
+                if (previousBlock != null && blockHeight > BlockManager.getFrozenEdgeHeight()) {
+                    transactions = BalanceManager.approvedTransactionsForBlock(transactions, previousBlock);
                 }
 
                 // Add/subtract all transactions.
@@ -617,6 +628,9 @@ public class Block implements MessageObject {
                         } else {
                             score += indexInQueue * 4L;
                         }
+
+                        // Penalize for each balance-list spam transaction.
+                        score += block.spamTransactionCount() * 5L;
                     }
                 } else {
                     Block previousBlock = getPreviousBlock();
@@ -626,14 +640,15 @@ public class Block implements MessageObject {
                         score += (previousBlock.getCycleInformation().getCycleLength() -
                                 cycleInformation.getCycleLength()) * 4L;
 
-                        // This penalty was previously imposed to prevent consolidation of verifiers after entering
-                        // the cycle. While protections against consolidation are necessary to promote verifier
-                        // diversity, these protections should be built around long-running metrics that actually
-                        // measure meaningful diversity and contribution to the health of the cycle, not something as
-                        // naive as this.
-                        //if (!NodeManager.isActive(verifierIdentifier)) {
-                        //    score += 5L;
-                        //}
+                        // If a verifier needs to be removed, apply a penalty score of 5. This will put it just behind
+                        // the next verifier in the cycle.
+                        if (score == 0 &&
+                                VerifierRemovalManager.shouldPenalizeVerifier(block.getVerifierIdentifier())) {
+                            score += 5L;
+                        }
+
+                        // Penalize for each balance-list spam transaction.
+                        score += block.spamTransactionCount() * 5L;
                     }
                 }
             }
@@ -645,6 +660,11 @@ public class Block implements MessageObject {
                 score = Long.MAX_VALUE;  // invalid
             }
 
+            // Check that the verification timestamp is not unreasonably far into the future.
+            if (block.getVerificationTimestamp() > System.currentTimeMillis() + 5000L) {
+                score = Long.MAX_VALUE;  // invalid
+            }
+
             block = previousBlock;
         }
 
@@ -653,6 +673,24 @@ public class Block implements MessageObject {
         }
 
         return score;
+    }
+
+    private int spamTransactionCount() {
+
+        // This method makes a best effort to calculate the spam transaction count. There are no reasons it should fail,
+        // but if it does for an unexpected reason, this should not cause the block score to be invalid, so a count of
+        // zero will be returned.
+        int count = 0;
+        Block previousBlock = getPreviousBlock();
+        if (previousBlock != null) {
+            BalanceList balanceList = BalanceListManager.balanceListForBlock(previousBlock);
+            if (balanceList != null) {
+                Map<ByteBuffer, Long> balanceMap = BalanceManager.makeBalanceMap(balanceList);
+                count = BalanceManager.numberOfTransactionsSpammingBalanceList(balanceMap, getTransactions());
+            }
+        }
+
+        return count;
     }
 
     @Override

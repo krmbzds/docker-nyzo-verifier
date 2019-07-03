@@ -2,10 +2,8 @@ package co.nyzo.verifier.sentinel;
 
 import co.nyzo.verifier.*;
 import co.nyzo.verifier.messages.*;
-import co.nyzo.verifier.util.IpUtil;
-import co.nyzo.verifier.util.PrintUtil;
-import co.nyzo.verifier.util.ThreadUtil;
-import co.nyzo.verifier.util.UpdateUtil;
+import co.nyzo.verifier.util.*;
+import co.nyzo.verifier.web.WebListener;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -14,92 +12,151 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Sentinel {
 
     private static final File managedVerifiersFile = new File(Verifier.dataRootDirectory, "managed_verifiers");
 
-    private static final long meshUpdateInterval = 20000L;
+    private static final long meshUpdateInterval = 1000L * 60L * 5L;  // 5 minutes
     private static final long blockUpdateIntervalFast = 1000L;
     private static final long blockUpdateIntervalStandard = 2000L;
+    private static final long minimumLoopInterval = 3000L;
 
-    private static final long blockTransmitDelay = 30000L;
+    private static final long blockCreationDelay = 20000L;
+    private static final long blockTransmissionDelay = 10000L;
 
-    private static int consecutiveSuccessfulBlockFetches = 0;
-    private static boolean inFastFetchMode = false;
+    private static Map<ByteBuffer, AtomicInteger> consecutiveSuccessfulBlockFetches = new ConcurrentHashMap<>();
+    private static Map<ByteBuffer, Boolean> inFastFetchMode = new ConcurrentHashMap<>();
 
-    private static int meshUpdateIndex = 0;
-    private static int blockUpdateIndex = 0;
+    private static int numberOfBlocksReceived = 0;
+    private static int numberOfBlocksFrozen = 0;
 
-    private static long lastMeshUpdateTimestamp = 0L;
-    private static long lastBlockUpdateTimestamp = 0L;
-    private static long lastBlockReceivedTimestamp = 0L;
+    private static AtomicLong lastBlockReceivedTimestamp = new AtomicLong(0L);
 
-    private static final List<ManagedVerifier> verifierList = new ArrayList<>();
-    private static final Map<ByteBuffer, ManagedVerifier> verifierMap = new HashMap<>();
+    private static final List<ManagedVerifier> verifierList = new CopyOnWriteArrayList<>();
+    private static final Map<ByteBuffer, ManagedVerifier> verifierMap = new ConcurrentHashMap<>();
 
-    private static final Set<Block> blocksCreatedForManagedVerifiers = new HashSet<>();
+    private static final Set<Block> blocksCreatedForManagedVerifiers = ConcurrentHashMap.newKeySet();
     private static boolean blockTransmittedForManagedVerifier = false;
 
-    private static final Map<ByteBuffer, List<Node>> verifierIdentifierToMeshMap = new HashMap<>();
+    private static final Map<ByteBuffer, List<Node>> verifierIdentifierToMeshMap = new ConcurrentHashMap<>();
 
-    private static final Random random = new Random();
+    private static Block frozenEdge = null;
+
 
     public static void main(String[] args) {
 
+        RunMode.setRunMode(RunMode.Sentinel);
+
+        // If the preference is set, start the web listener.
+        if (PreferencesUtil.getBoolean(WebListener.startWebListenerKey, false)) {
+            WebListener.start();
+        }
+
         SeedTransactionManager.start();
-        startMainLoop();
+        start();
     }
 
-    private static void startMainLoop() {
+    private static void start() {
+
+        int loopCount = 0;
+
+        Verifier.loadGenesisBlock();
+        BlockFileConsolidator.start();
+
+        // Load the managed verifiers. These are the verifiers for which the sentinel will produce blocks, if
+        // necessary, and they are also used as data sources.
+        loadManagedVerifiers();
+
+        // Fetch and process the bootstrap response. This process will repeat until it is successful.
+        boolean completedInitialization = false;
+        while (!completedInitialization) {
+            Set<BootstrapResponseV2> bootstrapResponses = fetchBootstrapResponses();
+            System.out.println("got " + bootstrapResponses.size() + " bootstrap responses");
+            completedInitialization = processBootstrapResponses(bootstrapResponses);
+        }
+
+        // Start a separate thread for fetching data from each of the managed verifiers. This may generate some
+        // redundant work, but it will ensure that the sentinel continues to function properly even if a large segment
+        // of the verifiers fail simultaneously.
+        int querySlot = 0;
+        for (ManagedVerifier verifier : verifierList) {
+            startThreadForVerifier(verifier, querySlot++);
+        }
+
+        // Start a single thread as a fallback for fetching blocks from the full mesh if all managed verifiers become
+        // unresponsive.
+        startFullMeshThread();
+
+        // Start the thread for transmitting blocks. While a separate thread is needed for fetching data from each
+        // managed verifier, only one thread is required for transmitting blocks, as only a single block at each height
+        // will protect all verifiers, regardless of how many are down at that time.
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                // Set the last-block received timestamp so we do not immediately transmit a block.
+                lastBlockReceivedTimestamp.set(System.currentTimeMillis());
+
+                // Run the main loop.
+                while (!UpdateUtil.shouldTerminate()) {
+                    transmitBlockIfNecessary();
+                    ThreadUtil.sleep(1000L);
+                }
+            }
+        }).start();
+    }
+
+    private static void startThreadForVerifier(ManagedVerifier verifier, int querySlot) {
 
         new Thread(new Runnable() {
             @Override
             public void run() {
 
-                int loopCount = 0;
-
-                Verifier.loadGenesisBlock();
-
-                // Load the managed verifiers. These are the verifiers for which the sentinel will produce blocks, if
-                // necessary, and they are also used as data sources.
-                loadManagedVerifiers();
-
-                // Fetch and process the bootstrap response. This process will repeat until it is successful.
-                boolean completedInitialization = false;
-                while (!completedInitialization) {
-                    BootstrapResponseV2 bootstrapResponse = fetchBootstrapResponse();
-                    System.out.println("bootstrap response is " + bootstrapResponse);
-                    completedInitialization = processBootstrapResponse(bootstrapResponse);
-                }
-
-                // This is the application loop.
+                ByteBuffer identifier = ByteBuffer.wrap(verifier.getIdentifier());
+                long lastBlockRequestedTimestamp = 0L;
+                long lastMeshUpdateTimestamp = 0L;
                 while (!UpdateUtil.shouldTerminate()) {
 
                     long loopStartTimestamp = System.currentTimeMillis();
+
+                    // This is an important step, though one that should be used with care in a situation with many
+                    // threads sending messages simultaneously. As all the individual verifier loops are invoking this
+                    // method, none will monopolize the queue.
+                    MessageQueue.blockThisThreadUntilClear();
 
                     // Update the mesh. We need to know who the in-cycle nodes are in order to send out a block if one
                     // needs to be created.
                     if (lastMeshUpdateTimestamp < System.currentTimeMillis() - meshUpdateInterval) {
                         lastMeshUpdateTimestamp = System.currentTimeMillis();
-                        updateMesh();
+                        updateMesh(verifier);
                     }
 
-                    // Update the blocks.
-                    long blockUpdateInterval = inFastFetchMode ? blockUpdateIntervalFast : blockUpdateIntervalStandard;
-                    if (lastBlockUpdateTimestamp < System.currentTimeMillis() - blockUpdateInterval) {
-                        lastBlockUpdateTimestamp = System.currentTimeMillis();
-                        updateBlocks();
+                    // Update the blocks. Both the fast-fetch setting and the interval are applied on a per-verifier
+                    // basis. If we are certain that we are close to the actual frozen edge of the blockchain, we query
+                    // only in our assigned slot to improve efficiency. Otherwise, all threads operate in parallel.
+                    long blockUpdateInterval = inFastFetchMode.get(identifier) ? blockUpdateIntervalFast :
+                            blockUpdateIntervalStandard;
+                    int currentSlot = (int) ((System.currentTimeMillis() / blockUpdateInterval) % verifierList.size());
+                    if (lastBlockRequestedTimestamp < System.currentTimeMillis() - blockUpdateInterval) {
+                        if (currentSlot == querySlot ||
+                                frozenEdge.getVerificationTimestamp() < System.currentTimeMillis() - 20000L) {
+                            lastBlockRequestedTimestamp = System.currentTimeMillis();
+                            updateBlocks(verifier);
+                            verifier.setQueriedLastInterval(true);
+                        } else {
+                            verifier.setQueriedLastInterval(false);
+                        }
                     }
 
-                    transmitBlockIfNecessary();
 
-                    MessageQueue.blockThisThreadUntilClear();
-
-                    // Ensure that the minimum interval between iterations is 1 second. This includes all processing
-                    // time, so the actual sleep might be zero.
-                    while (System.currentTimeMillis() < loopStartTimestamp + 1000L) {
+                    // Ensure a minimum interval between iterations. This includes processing time, so the actual sleep
+                    // time may be zero.
+                    while (System.currentTimeMillis() < loopStartTimestamp + minimumLoopInterval) {
                         ThreadUtil.sleep(300L);
                     }
                 }
@@ -107,102 +164,224 @@ public class Sentinel {
         }).start();
     }
 
+    private static void startFullMeshThread() {
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+
+                long lastBlockRequestedTimestamp = 0L;
+                while (!UpdateUtil.shouldTerminate()) {
+
+                    long loopStartTimestamp = System.currentTimeMillis();
+
+                    try {
+                        // This is an important step, though one that should be used with care in a situation with many
+                        // threads sending messages simultaneously. All the verifier loops are also invoking this
+                        // method, so none of the threads will monopolize the message queue.
+                        MessageQueue.blockThisThreadUntilClear();
+
+                        // Update the blocks. This method is only used as a second-level fallback when full-parallel
+                        // querying of managed verifiers is not providing blocks.
+                        if (lastBlockRequestedTimestamp < System.currentTimeMillis() - blockUpdateIntervalStandard &&
+                                (frozenEdge.getVerificationTimestamp() < System.currentTimeMillis() - 35000L)) {
+                            lastBlockRequestedTimestamp = System.currentTimeMillis();
+
+                            requestBlockWithVotes();
+                        }
+                    } catch (Exception e) {
+                        System.out.println("exception in full-mesh thread main loop: " + PrintUtil.printException(e));
+                    }
+
+                    // Ensure a minimum interval between iterations. This includes processing time, so the actual sleep
+                    // time may be zero.
+                    while (System.currentTimeMillis() < loopStartTimestamp + minimumLoopInterval) {
+                        ThreadUtil.sleep(300L);
+                    }
+                }
+            }
+        }).start();
+    }
+
+    private static void requestBlockWithVotes() {
+
+        // This method is a simplification of the verifier process. The block-with-votes bundle is fetched, and the
+        // block is immediately frozen if the data is sufficient.
+
+        long heightToRequest = frozenEdge.getBlockHeight() + 1L;
+        System.out.println("requesting block with votes for height " + heightToRequest);
+        BlockWithVotesRequest request = new BlockWithVotesRequest(heightToRequest);
+        Message message = new Message(MessageType.BlockWithVotesRequest37, request);
+        Message.fetchFromRandomNode(message, new MessageCallback() {
+            @Override
+            public void responseReceived(Message message) {
+
+                BlockWithVotesResponse response = message == null ? null :
+                        (BlockWithVotesResponse) message.getContent();
+                LogUtil.println("block-with-votes response is " + response);
+                if (response != null && response.getBlock() != null && !response.getVotes().isEmpty()) {
+
+                    int voteThreshold = BlockManager.currentCycleLength() * 3 / 4;
+                    int voteCount = 0;
+                    byte[] blockHash = response.getBlock().getHash();
+
+                    // Count the votes for the block.
+                    for (BlockVote vote : response.getVotes()) {
+                        if (ByteUtil.arraysAreEqual(blockHash, vote.getHash())) {
+                            // Reconstruct the message in which the vote was originally sent. If the signature is
+                            // valid and the verifier is in the cycle, count the vote.
+                            Message voteMessage = new Message(vote.getMessageTimestamp(), MessageType.BlockVote19,
+                                    vote, vote.getSenderIdentifier(), vote.getMessageSignature(),
+                                    new byte[FieldByteSize.ipAddress]);
+                            ByteBuffer senderIdentifier = ByteBuffer.wrap(vote.getSenderIdentifier());
+                            if (voteMessage.isValid() && BlockManager.verifierInCurrentCycle(senderIdentifier)) {
+                                voteCount++;
+                            }
+                        }
+                    }
+
+                    // If the vote count exceeds the threshold, freeze the block.
+                    System.out.println("block with votes: count=" + voteCount + ", threshold=" + voteThreshold);
+                    if (voteCount > voteThreshold) {
+                        freezeBlock(response.getBlock());
+                    }
+                }
+            }
+        });
+    }
+
+    public static Node randomNode() {
+
+        Node node = null;
+
+        // This is a nice balance of reasonable randomness and reasonable performance.
+        List<ByteBuffer> verifierIdentifiers = new ArrayList<>(verifierIdentifierToMeshMap.keySet());
+        Collections.shuffle(verifierIdentifiers);
+        Random random = new Random();
+        while (node == null && !verifierIdentifiers.isEmpty()) {
+            ByteBuffer verifierIdentifier = verifierIdentifiers.remove(0);
+            List<Node> nodes = new ArrayList<>(verifierIdentifierToMeshMap.get(verifierIdentifier));
+            if (!nodes.isEmpty()) {
+                node = nodes.get(random.nextInt(nodes.size()));
+            }
+        }
+
+        return node;
+    }
+
     private static void loadManagedVerifiers() {
 
         Path path = Paths.get(managedVerifiersFile.getAbsolutePath());
-        List<ManagedVerifier> managedVerifiers = new ArrayList<>();
         try {
             List<String> contentsOfFile = Files.readAllLines(path);
             for (String line : contentsOfFile) {
                 line = line.trim();
                 int indexOfHash = line.indexOf("#");
+                String comment = "";
                 if (indexOfHash >= 0) {
+                    comment = line.substring(indexOfHash + 1).trim();
                     line = line.substring(0, indexOfHash).trim();
                 }
                 ManagedVerifier verifier = ManagedVerifier.fromString(line);
                 if (verifier != null) {
-                    managedVerifiers.add(verifier);
+                    verifierMap.put(ByteBuffer.wrap(verifier.getIdentifier()), verifier);
+                    verifierList.add(verifier);
+
+                    // In there is a comment, add it to the nickname manager for display in the monitoring interface.
+                    if (!comment.isEmpty()) {
+                        NicknameManager.put(verifier.getIdentifier(), comment);
+                    }
+
+                    // Also populate the maps here to avoid having to check for null values.
+                    ByteBuffer identifier = ByteBuffer.wrap(verifier.getIdentifier());
+                    consecutiveSuccessfulBlockFetches.put(identifier, new AtomicInteger());
+                    inFastFetchMode.put(identifier, false);
                 }
             }
         } catch (Exception e) {
             System.out.println("issue getting managed verifiers: " + PrintUtil.printException(e));
         }
 
-        for (ManagedVerifier verifier : managedVerifiers) {
-
+        // Display the verifiers that were loaded into the list.
+        for (ManagedVerifier verifier : verifierList) {
             System.out.println("got managed verifier: " + verifier);
-            verifierList.add(verifier);
-            verifierMap.put(ByteBuffer.wrap(verifier.getIdentifier()), verifier);
         }
     }
 
-    private static BootstrapResponseV2 fetchBootstrapResponse() {
+    private static Set<BootstrapResponseV2> fetchBootstrapResponses() {
 
-        // Get the bootstrap response from one node. We fully trust all the nodes that we manage in the
-        // sentinel, so instead of the democratic process of the trusted entry points of the verifier, this
-        // only requires a single response.
-        Set<BootstrapResponseV2> bootstrapResponseSet = new HashSet<>();  // a set for threading
-        int verifierIndex = 0;
-        while (bootstrapResponseSet.isEmpty()) {
+        // Try to get a bootstrap response from each managed node. While we fully trust every node we manage, some may
+        // be behind, so we want to query as many as possible to ensure we start as close to the cycle frozen edge as
+        // possible. Continue looping until at least one response is received.
+        Set<BootstrapResponseV2> bootstrapResponses = ConcurrentHashMap.newKeySet();
+        while (bootstrapResponses.isEmpty()) {
 
-            ManagedVerifier verifier = verifierList.get(verifierIndex);
-            verifierIndex = (verifierIndex + 1) % verifierList.size();
+            AtomicInteger numberOfResponsesPending = new AtomicInteger(verifierList.size());
+            for (ManagedVerifier verifier : verifierList) {
 
-            System.out.println("sending bootstrap request to " + verifier.getHost());
+                Message bootstrapRequest = new Message(MessageType.BootstrapRequestV2_35, new BootstrapRequest());
+                Message.fetchTcp(verifier.getHost(), verifier.getPort(), bootstrapRequest, new MessageCallback() {
+                    @Override
+                    public void responseReceived(Message message) {
 
-            AtomicBoolean receivedResponse = new AtomicBoolean(false);
-
-            Message bootstrapRequest = new Message(MessageType.BootstrapRequestV2_35,
-                    new BootstrapRequest(MeshListener.getPort()));
-            Message.fetch(verifier.getHost(), verifier.getPort(), bootstrapRequest, new MessageCallback() {
-                @Override
-                public void responseReceived(Message message) {
-
-                    if (message != null) {
-                        bootstrapResponseSet.add((BootstrapResponseV2) message.getContent());
+                        System.out.println("response from " + verifier.getHost() + " is " + message);
+                        if (message != null && (message.getContent() instanceof BootstrapResponseV2)) {
+                            bootstrapResponses.add((BootstrapResponseV2) message.getContent());
+                        }
+                        numberOfResponsesPending.decrementAndGet();
                     }
-                    receivedResponse.set(true);
-                }
-            });
+                });
+            }
 
-            for (int i = 0; i < 10 && !receivedResponse.get(); i++) {
-                System.out.println("waiting for bootstrap response from " + verifier.getHost());
+            // Wait for all responses to return.
+            int waitIteration = 0;
+            while (numberOfResponsesPending.get() > 0) {
                 ThreadUtil.sleep(300L);
+                System.out.println("after wait iteration " + waitIteration++ + ", " + numberOfResponsesPending.get() +
+                        " bootstrap responses pending, have " + bootstrapResponses.size() + " good responses");
             }
         }
 
-        // Return the only element of the set.
-        return bootstrapResponseSet.iterator().next();
+        return bootstrapResponses;
     }
 
-    private static boolean processBootstrapResponse(BootstrapResponseV2 bootstrapResponse) {
+    private static boolean processBootstrapResponses(Set<BootstrapResponseV2> bootstrapResponses) {
 
         boolean successful = false;
 
+        System.out.println("processing bootstrap responses");
+
         // Get the local and chain frozen edges. If the chain is within four cycles of the local frozen edge, we do
         // not need to fetch anything here. The standard block-fetch process will get the chain. If the chain is not
-        // within four cycles of the local frozen edge, we fetch and freeze one block four cycles back.
+        // within four cycles of the local frozen edge, we fetch and freeze one recent block.
         long localFrozenEdge = BlockManager.getFrozenEdgeHeight();
-        long chainFrozenEdge = bootstrapResponse.getFrozenEdgeHeight();
+        long chainFrozenEdge = localFrozenEdge;
+        List<ByteBuffer> cycleVerifiers = new ArrayList<>();
+        for (BootstrapResponseV2 bootstrapResponse : bootstrapResponses) {
+            if (bootstrapResponse.getFrozenEdgeHeight() > chainFrozenEdge) {
+                chainFrozenEdge = bootstrapResponse.getFrozenEdgeHeight();
+                cycleVerifiers = bootstrapResponse.getCycleVerifiers();
+            }
+        }
 
-        long cutoffHeight = chainFrozenEdge - bootstrapResponse.getCycleVerifiers().size() * 4;
+        long cutoffHeight = chainFrozenEdge - cycleVerifiers.size() * 4;
         if (localFrozenEdge >= cutoffHeight) {
             // If the frozen edge is close enough, nothing needs to be done. Flag processing as successful.
+            frozenEdge = BlockManager.frozenBlockForHeight(localFrozenEdge);
             successful = true;
         } else {
-            AtomicBoolean processedResponse = new AtomicBoolean(false);
 
-            // Try to get the block at the cutoff height. This will, at most, query each verifier once. If it fails for
-            // all, this method returns a false value, causing a new bootstrap response to be fetched again and this
-            // process to be attempted again.
-            Set<Block> blockAsSet = new HashSet<>();
-            Set<BalanceList> balanceListAsSet = new HashSet<>();
-            Message message = new Message(MessageType.BlockRequest11, new BlockRequest(cutoffHeight, cutoffHeight,
+            // Try to get the block at the chain frozen edge. This sends requests to every managed verifier, but only
+            // one good response is needed.
+            Set<Block> blocks = ConcurrentHashMap.newKeySet();
+            Set<BalanceList> balanceLists = ConcurrentHashMap.newKeySet();
+            long requestHeight = chainFrozenEdge;
+            Message message = new Message(MessageType.BlockRequest11, new BlockRequest(requestHeight, requestHeight,
                     true));
-            for (int i = 0; i < verifierList.size() && (blockAsSet.isEmpty() || balanceListAsSet.isEmpty()); i++) {
+            AtomicInteger numberOfResponsesPending = new AtomicInteger(verifierList.size());
+            for (ManagedVerifier verifier : verifierList) {
 
-                ManagedVerifier verifier = verifierList.get(i);
-                Message.fetch(verifier.getHost(), verifier.getPort(), message, new MessageCallback() {
+                Message.fetchTcp(verifier.getHost(), verifier.getPort(), message, new MessageCallback() {
                     @Override
                     public void responseReceived(Message message) {
 
@@ -211,56 +390,58 @@ public class Sentinel {
                                 BlockResponse blockResponse = (BlockResponse) message.getContent();
                                 Block block = blockResponse.getBlocks().get(0);
                                 BalanceList balanceList = blockResponse.getInitialBalanceList();
-                                if (block.getBlockHeight() == cutoffHeight &&
-                                        balanceList.getBlockHeight() == cutoffHeight) {
-                                    blockAsSet.add(block);
-                                    balanceListAsSet.add(balanceList);
+                                if (block.getBlockHeight() == requestHeight &&
+                                        balanceList.getBlockHeight() == requestHeight) {
+                                    blocks.add(block);
+                                    balanceLists.add(balanceList);
                                 }
                             } catch (Exception ignored) { }
                         }
 
-                        processedResponse.set(true);
+                        numberOfResponsesPending.decrementAndGet();
                     }
                 });
+            }
 
-                while (!processedResponse.get()) {
-                    ThreadUtil.sleep(300L);
-                }
+            // Wait for all responses to return.
+            int waitIteration = 0;
+            while (numberOfResponsesPending.get() > 0) {
+                ThreadUtil.sleep(300L);
+                System.out.println("after wait iteration " + waitIteration++ + ", " + numberOfResponsesPending.get() +
+                        " block responses pending");
             }
 
             // If a block was obtained, freeze it and flag that we have successfully processed the bootstrap response.
-            if (!blockAsSet.isEmpty() && !balanceListAsSet.isEmpty()) {
+            if (!blocks.isEmpty() && !balanceLists.isEmpty()) {
 
-                Block block = blockAsSet.iterator().next();
-                BalanceList balanceList = balanceListAsSet.iterator().next();
-                BlockManager.freezeBlock(block, block.getPreviousBlockHash(), balanceList,
-                        bootstrapResponse.getCycleVerifiers());
+                Block block = blocks.iterator().next();
+                BalanceList balanceList = balanceLists.iterator().next();
+                BlockManager.freezeBlock(block, block.getPreviousBlockHash(), balanceList, cycleVerifiers);
+                frozenEdge = block;
 
                 successful = true;
 
                 // This timestamp is set whenever we receive a block so we do not try to create a block too soon
                 // afterwards.
-                lastBlockReceivedTimestamp = System.currentTimeMillis();
+                lastBlockReceivedTimestamp.set(System.currentTimeMillis());
             }
         }
 
         // If we know that we are more than 20 blocks behind the frozen edge, start in fast-fetch mode.
-        if (BlockManager.getFrozenEdgeHeight() < bootstrapResponse.getFrozenEdgeHeight() - 20) {
-            inFastFetchMode = true;
+        if (BlockManager.getFrozenEdgeHeight() < chainFrozenEdge - 20) {
+            for (ManagedVerifier verifier : verifierList) {
+                inFastFetchMode.put(ByteBuffer.wrap(verifier.getIdentifier()), true);
+            }
         }
 
         return successful;
     }
 
-    private static void updateMesh() {
-
-        // Get the verifier from the list and advance the static index for the next iteration.
-        ManagedVerifier verifier = verifierList.get(meshUpdateIndex);
-        meshUpdateIndex = (meshUpdateIndex + 1) % verifierList.size();
+    private static void updateMesh(ManagedVerifier verifier) {
 
         // Get the mesh.
         Message message = new Message(MessageType.MeshRequest15, null);
-        Message.fetch(verifier.getHost(), 9444, message, new MessageCallback() {
+        Message.fetchTcp(verifier.getHost(), verifier.getPort(), message, new MessageCallback() {
             @Override
             public void responseReceived(Message message) {
 
@@ -268,10 +449,8 @@ public class Sentinel {
                     if (message != null) {
                         MeshResponse response = (MeshResponse) message.getContent();
                         if (!response.getMesh().isEmpty()) {
-                            synchronized (Sentinel.class) {
-                                verifierIdentifierToMeshMap.put(ByteBuffer.wrap(message.getSourceNodeIdentifier()),
-                                        response.getMesh());
-                            }
+                            verifierIdentifierToMeshMap.put(ByteBuffer.wrap(message.getSourceNodeIdentifier()),
+                                    response.getMesh());
                         }
                     }
                 } catch (Exception ignored) { }
@@ -279,34 +458,43 @@ public class Sentinel {
         });
     }
 
-    private static void updateBlocks() {
+    private static void updateBlocks(ManagedVerifier verifier) {
 
-        // Get the verifier from the list and advance the index.
-        ManagedVerifier verifier = verifierList.get(blockUpdateIndex);
-        blockUpdateIndex = (blockUpdateIndex + 1) % verifierList.size();
+        ByteBuffer identifier = ByteBuffer.wrap(verifier.getIdentifier());
 
-        // Get the next block in normal mode and the
+        // Get the next block in normal mode and the next 10 blocks in fast-fetch mode.
         long startHeightToFetch = BlockManager.getFrozenEdgeHeight() + 1L;
-        long endHeightToFetch = startHeightToFetch + (inFastFetchMode ? 9 : 0);
+        long endHeightToFetch = startHeightToFetch + (inFastFetchMode.getOrDefault(identifier, false) ? 9 : 0);
         List<Block> blockList = new ArrayList<>();
         Message message = new Message(MessageType.BlockRequest11, new BlockRequest(startHeightToFetch, endHeightToFetch,
                 false));
 
         AtomicBoolean processedResponse = new AtomicBoolean(false);
-        Message.fetch(verifier.getHost(), verifier.getPort(), message, new MessageCallback() {
+        Message.fetchTcp(verifier.getHost(), verifier.getPort(), message, new MessageCallback() {
             @Override
             public void responseReceived(Message message) {
 
-                if (message != null) {
+                int result;
+                if (message == null) {
+                    result = ManagedVerifier.queryResultErrorValue;
+                } else {
                     try {
                         BlockResponse blockResponse = (BlockResponse) message.getContent();
                         List<Block> blocks = blockResponse.getBlocks();
-                        if (blocks.size() > 0 && blocks.get(0).getBlockHeight() == startHeightToFetch &&
-                        blocks.get(blocks.size() - 1).getBlockHeight() == endHeightToFetch) {
+                        if (blocks.size() == 0) {
+                            result = 0;
+                        } else if (blocks.get(0).getBlockHeight() == startHeightToFetch &&
+                                blocks.get(blocks.size() - 1).getBlockHeight() == endHeightToFetch) {
                             blockList.addAll(blocks);
+                            result = blockList.size();
+                        } else {
+                            result = ManagedVerifier.queryResultErrorValue;
                         }
-                    } catch (Exception ignored) { }
+                    } catch (Exception ignored) {
+                        result = ManagedVerifier.queryResultErrorValue;
+                    }
                 }
+                verifier.logResult(result);
 
                 processedResponse.set(true);
             }
@@ -319,43 +507,45 @@ public class Sentinel {
         // If we obtained a block, freeze it.
         if (!blockList.isEmpty()) {
             for (Block block : blockList) {
-                System.out.println("freezing block " + block);
-                BlockManager.freezeBlock(block);
+                freezeBlock(block);
             }
-            lastBlockReceivedTimestamp = System.currentTimeMillis();
+            lastBlockReceivedTimestamp.set(System.currentTimeMillis());
+
+            // Perform maintenance on the unfrozen block manager. Blocks are automatically registered with the manager
+            // in block requests, so they must be periodically removed to prevent problems.
+            UnfrozenBlockManager.performMaintenance();
 
             // Four consecutive successes activate fast-fetch mode unless we are very close to the open edge. The
             // interval between fetches is less than the block duration, so multiple consecutive successful fetches
             // typically indicate that we need to catch up.
-            consecutiveSuccessfulBlockFetches++;
-            if (consecutiveSuccessfulBlockFetches >= 4 &&
+            if (consecutiveSuccessfulBlockFetches.get(identifier).incrementAndGet() >= 4 &&
                     BlockManager.getFrozenEdgeHeight() < BlockManager.openEdgeHeight(false) - 10) {
-                if (!inFastFetchMode) {
+                if (!inFastFetchMode.get(identifier)) {
+                    inFastFetchMode.put(identifier, true);
                     System.out.println("***** fast-fetch mode activated *****");
                 }
-                inFastFetchMode = true;
             }
         } else {
             // Two consecutive failures deactivate fast-fetch mode.
-            if (consecutiveSuccessfulBlockFetches == 0) {
-                if (inFastFetchMode) {
+            if (consecutiveSuccessfulBlockFetches.get(identifier).get() == 0) {
+                if (inFastFetchMode.get(identifier)) {
+                    inFastFetchMode.put(identifier, false);
                     System.out.println("***** fast-fetch mode deactivated *****");
                 }
-                inFastFetchMode = false;
+            } else {
+                consecutiveSuccessfulBlockFetches.get(identifier).set(0);
             }
-
-            consecutiveSuccessfulBlockFetches = 0;
         }
     }
 
     private static void transmitBlockIfNecessary() {
 
-        // Check if the last new block was received too long ago. If so, make blocks for the managed verifiers and
-        // transmit if the scores justify transmission.
-        long frozenEdgeHeight = BlockManager.getFrozenEdgeHeight();
+        long frozenEdgeHeight = frozenEdge.getBlockHeight();
         long heightToProcess = frozenEdgeHeight + 1L;
-        Block frozenEdge = BlockManager.frozenBlockForHeight(frozenEdgeHeight);
-        if (lastBlockReceivedTimestamp < System.currentTimeMillis() - blockTransmitDelay) {
+
+        // The block creation delay prevents unnecessary work and unnecessary transmissions to the mesh when the
+        // sentinel is initializing.
+        if (lastBlockReceivedTimestamp.get() < System.currentTimeMillis() - blockCreationDelay) {
 
             // This loop is fully serial, so there is no concern about threading issues. Check if the blocks
             // created are for the height to process. If not, clear them out.
@@ -366,9 +556,7 @@ public class Sentinel {
                 }
             }
 
-            // If the map of blocks is empty, make them now. We need not worry about the inefficiency of
-            // creating all the blocks, as the circumstance of the frozen edge being verified more than 30 seconds
-            // ago must be uncommon for the blockchain to continue to function.
+            // If the map of blocks is empty, make the blocks now.
             if (blocksCreatedForManagedVerifiers.isEmpty()) {
                 for (ManagedVerifier verifier : verifierList) {
                     Block block = createNextBlock(frozenEdge, verifier);
@@ -389,8 +577,9 @@ public class Sentinel {
 
                 Block lowestScoredBlock = null;
                 for (Block block : blocksCreatedForManagedVerifiers) {
-                    if (lowestScoredBlock == null || block.chainScore(frozenEdgeHeight) <
-                            lowestScoredBlock.chainScore(frozenEdgeHeight)) {
+                    if (BlockManager.verifierInCurrentCycle(ByteBuffer.wrap(block.getVerifierIdentifier())) &&
+                            (lowestScoredBlock == null || block.chainScore(frozenEdgeHeight) <
+                            lowestScoredBlock.chainScore(frozenEdgeHeight))) {
                         lowestScoredBlock = block;
                     }
                 }
@@ -400,8 +589,12 @@ public class Sentinel {
                 // in the future.
                 if (lowestScoredBlock != null) {
 
-                    long minimumVoteTimestamp = frozenEdge.getVerificationTimestamp() + Block.blockDuration +
-                            Block.minimumVerificationInterval + lowestScoredBlock.chainScore(frozenEdgeHeight) * 20000L;
+                    long minimumVoteTimestamp = frozenEdge.getVerificationTimestamp() +
+                            Block.minimumVerificationInterval +
+                            lowestScoredBlock.chainScore(frozenEdgeHeight) * 20000L + blockTransmissionDelay;
+
+                    System.out.println(String.format("minimum vote timestamp is in %.1f seconds",
+                            (minimumVoteTimestamp - System.currentTimeMillis()) / 1000.0));
 
                     if (minimumVoteTimestamp < System.currentTimeMillis()) {
 
@@ -413,8 +606,7 @@ public class Sentinel {
                         message.sign(verifier.getSeed());
 
                         for (Node node : combinedCycle()) {
-                            Message.fetch(IpUtil.addressAsString(node.getIpAddress()), node.getPort(), message,
-                                    null);
+                            Message.fetch(node, message, null);
                         }
                         blockTransmittedForManagedVerifier = true;
                         System.out.println("sent block for " +
@@ -427,7 +619,7 @@ public class Sentinel {
         }
     }
 
-    private static synchronized Set<Node> combinedCycle() {
+    private static Set<Node> combinedCycle() {
 
         Map<ByteBuffer, Node> ipAddressToNodeMap = new HashMap<>();
         for (List<Node> nodes : verifierIdentifierToMeshMap.values()) {
@@ -470,7 +662,8 @@ public class Sentinel {
                 byte[] receiverIdentifier = new byte[FieldByteSize.identifier];
                 long previousHashHeight = previousBlock.getBlockHeight();
                 byte[] previousBlockHash = previousBlock.getHash();
-                byte[] senderData = "block produced by Nyzo sentinel".getBytes(StandardCharsets.UTF_8);
+                String dataString = "block from sentinel v" + Version.getVersion();
+                byte[] senderData = dataString.getBytes(StandardCharsets.UTF_8);
                 Transaction sentinelTransaction = Transaction.standardTransaction(timestamp, amount, receiverIdentifier,
                         previousHashHeight, previousBlockHash, senderData, verifier.getSeed());
                 transactions.add(sentinelTransaction);
@@ -479,7 +672,7 @@ public class Sentinel {
             List<Transaction> approvedTransactions = BalanceManager.approvedTransactionsForBlock(transactions,
                     previousBlock);
 
-            BalanceList previousBalanceList = BalanceListManager.balanceListForBlock(previousBlock, null);
+            BalanceList previousBalanceList = BalanceListManager.balanceListForBlock(previousBlock);
             BalanceList balanceList = Block.balanceListForNextBlock(previousBlock, previousBalanceList,
                     approvedTransactions, verifier.getIdentifier());
             if (balanceList != null) {
@@ -489,6 +682,27 @@ public class Sentinel {
             }
         }
 
+
         return block;
+    }
+
+    private static synchronized void freezeBlock(Block block) {
+
+        numberOfBlocksReceived++;
+        if (block.getBlockHeight() == BlockManager.getFrozenEdgeHeight() + 1L) {
+            numberOfBlocksFrozen++;
+            BlockManager.freezeBlock(block);
+            frozenEdge = block;
+
+            System.out.println("froze block " + block + String.format(", efficiency: %.1f%%", getEfficiency()));
+        }
+    }
+
+    public static double getEfficiency() {
+        return numberOfBlocksFrozen * 100.0 / Math.max(1.0, numberOfBlocksReceived);
+    }
+
+    public static List<ManagedVerifier> getManagedVerifiers() {
+        return verifierList;
     }
 }

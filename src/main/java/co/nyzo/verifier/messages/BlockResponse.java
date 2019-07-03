@@ -1,23 +1,60 @@
 package co.nyzo.verifier.messages;
 
 import co.nyzo.verifier.*;
+import co.nyzo.verifier.util.IpUtil;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BlockResponse implements MessageObject {
+
+    private static int numberOfAdditionsToMapSinceCleaning = 0;
+    private static final long minimumBalanceListRequestInterval = 1000L * 60L * 10L;  // 10 minutes
+    private static final Map<ByteBuffer, Long> balanceListRequestIpToTimestampMap = new ConcurrentHashMap<>();
 
     private BalanceList initialBalanceList;
     private List<Block> blocks;
 
-    public BlockResponse(long startBlockHeight, long endBlockHeight, boolean includeInitialBalanceList) {
+    public BlockResponse(long startBlockHeight, long endBlockHeight, boolean includeInitialBalanceList,
+                         byte[] requestSourceIpAddress) {
 
         BalanceList initialBalanceList = null;
         List<Block> blocks = new ArrayList<>();
 
+        // If the request asks for an initial balance list, the IP is not whitelisted, and the same source IP has
+        // recently requested a balance list, provide an empty response.
+        boolean requestIsValid = true;
+        if (!Message.ipIsWhitelisted(requestSourceIpAddress) && includeInitialBalanceList) {
+            ByteBuffer ipAddressBuffer = ByteBuffer.wrap(requestSourceIpAddress);
+            long previousRequestTimestamp = balanceListRequestIpToTimestampMap.getOrDefault(ipAddressBuffer, 0L);
+            if (previousRequestTimestamp > System.currentTimeMillis() - minimumBalanceListRequestInterval) {
+                requestIsValid = false;
+                byte[] identifier = NodeManager.identifierForIpAddress(requestSourceIpAddress);
+                System.out.println("refusing to produce BlockResponse for " +
+                        IpUtil.addressAsString(requestSourceIpAddress) + " (" + NicknameManager.get(identifier) + ")");
+            } else {
+                balanceListRequestIpToTimestampMap.put(ipAddressBuffer, System.currentTimeMillis());
+            }
+
+            if (numberOfAdditionsToMapSinceCleaning++ > 100) {
+                numberOfAdditionsToMapSinceCleaning = 0;
+                for (ByteBuffer ipAddress : new HashSet<>(balanceListRequestIpToTimestampMap.keySet())) {
+                    if (balanceListRequestIpToTimestampMap.getOrDefault(ipAddress, 0L) < System.currentTimeMillis() -
+                            minimumBalanceListRequestInterval) {
+                        balanceListRequestIpToTimestampMap.remove(ipAddress);
+                    }
+                }
+                System.out.println("cleaned BlockResponse timestamp map; size is now " +
+                        balanceListRequestIpToTimestampMap.size());
+            }
+        }
+
         // To conserve resources, only respond to block requests for 10 or fewer blocks.
-        if (endBlockHeight - startBlockHeight < 10) {
+        if (requestIsValid && endBlockHeight - startBlockHeight < 10) {
             int totalByteSize = 0;
             boolean foundNullBlock = false;
             long blockHeight = endBlockHeight;
@@ -29,8 +66,7 @@ public class BlockResponse implements MessageObject {
                     blocks.add(0, block);
                     totalByteSize += block.getByteSize();
                     if (blockHeight == startBlockHeight && includeInitialBalanceList) {
-                        System.out.println("trying to get balance list at height " + blockHeight);
-                        initialBalanceList = BalanceListManager.balanceListForBlock(block, null);
+                        initialBalanceList = BalanceListManager.recentBalanceListForHeight(block.getBlockHeight());
                     }
                 }
 
@@ -104,15 +140,15 @@ public class BlockResponse implements MessageObject {
             }
 
             List<Block> blocks = new ArrayList<>();
-            int numberOfBlocks = buffer.getShort() & 0xffff;
+            int numberOfBlocks = Math.min(buffer.getShort() & 0xffff, 10);
             for (int i = 0; i < numberOfBlocks; i++) {
-                blocks.add(Block.fromByteBuffer(buffer));
+                Block block = Block.fromByteBuffer(buffer);
+                blocks.add(block);
+                UnfrozenBlockManager.registerBlock(block);
             }
 
             result = new BlockResponse(initialBalanceList, blocks);
-        } catch (Exception ignored) {
-            ignored.printStackTrace();
-        }
+        } catch (Exception ignored) { }
 
         return result;
     }

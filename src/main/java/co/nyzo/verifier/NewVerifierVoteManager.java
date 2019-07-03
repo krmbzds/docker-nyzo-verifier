@@ -1,14 +1,10 @@
 package co.nyzo.verifier;
 
 import co.nyzo.verifier.messages.NewVerifierVote;
-import co.nyzo.verifier.messages.StatusResponse;
 
-import java.net.URL;
 import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.nio.channels.ReadableByteChannel;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class NewVerifierVoteManager {
 
@@ -21,9 +17,7 @@ public class NewVerifierVoteManager {
     // The local vote is redundant, but it is a simple and efficient way to store the local vote for responding to
     // node-join messages.
     private static NewVerifierVote localVote = new NewVerifierVote(new byte[FieldByteSize.identifier]);
-    private static final Map<ByteBuffer, ByteBuffer> voteMap = new HashMap<>();
-
-    private static int meshLimit = Integer.MAX_VALUE;
+    private static final Map<ByteBuffer, ByteBuffer> voteMap = new ConcurrentHashMap<>();
 
     private static byte[] override = new byte[FieldByteSize.identifier];
 
@@ -35,32 +29,12 @@ public class NewVerifierVoteManager {
         return override;
     }
 
-    public static void updateMeshLimit() {
-
-        try {
-            URL url = new URL("https://nyzo.co/meshLimit");
-            ReadableByteChannel channel = Channels.newChannel(url.openStream());
-            byte[] array = new byte[100];
-            ByteBuffer buffer = ByteBuffer.wrap(array);
-            while (channel.read(buffer) > 0) { }
-            channel.close();
-
-            byte[] value = Arrays.copyOf(array, buffer.position());
-            String meshLimitString = new String(value, StandardCharsets.UTF_8);
-            meshLimit = Integer.parseInt(meshLimitString);
-        } catch (Exception ignored) { }
-    }
-
-    public static synchronized void registerVote(byte[] votingIdentifier, NewVerifierVote vote, boolean isLocalVote) {
-
-        // If the voting verifiers list is empty, accept votes from all verifiers. This will happen only rarely, if
-        // ever, but this condition is helpful for testing.
-        boolean acceptAllVotes = BlockManager.currentCycleLength() == 0;
+    public static void registerVote(byte[] votingIdentifier, NewVerifierVote vote, boolean isLocalVote) {
 
         // Register the vote. The map ensures that each identifier only gets one vote. Some of the votes may not count.
         // Votes are only counted for verifiers in the previous cycle.
         ByteBuffer votingIdentifierBuffer = ByteBuffer.wrap(votingIdentifier);
-        if (BlockManager.verifierInCurrentCycle(votingIdentifierBuffer) || acceptAllVotes) {
+        if (BlockManager.verifierInCurrentCycle(votingIdentifierBuffer)) {
             voteMap.put(votingIdentifierBuffer, ByteBuffer.wrap(vote.getIdentifier()));
         }
 
@@ -69,7 +43,7 @@ public class NewVerifierVoteManager {
         }
     }
 
-    public static synchronized void removeOldVotes() {
+    public static void removeOldVotes() {
 
         // For simplicity, we remove all votes that are not in the current verifier cycle to conserve memory. This will
         // potentially remove verifiers that would be in the verification cycle when they are needed, but that's not
@@ -77,27 +51,20 @@ public class NewVerifierVoteManager {
         // reality, we are highly unlikely to ever lose more than one vote at a time due to this simplification.
 
         Set<ByteBuffer> verifiers = new HashSet<>(voteMap.keySet());
-        Set<ByteBuffer> currentCycle = BlockManager.verifiersInCurrentCycleSet();
         for (ByteBuffer verifier : verifiers) {
-            if (!currentCycle.contains(verifier)) {
+            if (!BlockManager.verifierInCurrentCycle(verifier)) {
                 voteMap.remove(verifier);
             }
         }
     }
 
-    public static synchronized Map<ByteBuffer, Integer> voteTotals() {
-
-
-        // If the voting verifiers list is empty, accept votes from all verifiers. This will happen only rarely, if
-        // ever, but this condition is helpful for testing.
-        Set<ByteBuffer> votingVerifiers = BlockManager.verifiersInCurrentCycleSet();
-        boolean acceptAllVotes = votingVerifiers.isEmpty();
+    public static Map<ByteBuffer, Integer> voteTotals() {
 
         Map<ByteBuffer, Integer> voteTotals = new HashMap<>();
         for (ByteBuffer votingVerifier : voteMap.keySet()) {
-            if (votingVerifiers.contains(votingVerifier) || acceptAllVotes) {
+            if (BlockManager.verifierInCurrentCycle(votingVerifier)) {
                 ByteBuffer vote = voteMap.get(votingVerifier);
-                if (!BlockManager.verifierInCurrentCycle(vote) && NodeManager.isActive(vote.array())) {
+                if (vote != null && !BlockManager.verifierInCurrentCycle(vote)) {
                     Integer votesForVerifier = voteTotals.getOrDefault(vote, 0);
                     voteTotals.put(vote, votesForVerifier + 1);
                 }
@@ -107,53 +74,38 @@ public class NewVerifierVoteManager {
         return voteTotals;
     }
 
-    public static synchronized List<ByteBuffer> topVerifiers() {
+    public static List<ByteBuffer> topVerifiers() {
 
-        List<ByteBuffer> topVerifiers = new ArrayList<>();
-
-        // Only build the list if we still have room under the cycle limit.
-        Set<ByteBuffer> votingVerifiers = BlockManager.verifiersInCurrentCycleSet();
-        if (votingVerifiers.size() < meshLimit) {
-
-            // Make and sort the list descending on votes.
-            Map<ByteBuffer, Integer> voteTotals = voteTotals();
-            topVerifiers.addAll(voteTotals.keySet());
-            Collections.sort(topVerifiers, new Comparator<ByteBuffer>() {
-                @Override
-                public int compare(ByteBuffer verifierVote1, ByteBuffer verifierVote2) {
-                    Integer voteCount1 = voteTotals.get(verifierVote1);
-                    Integer voteCount2 = voteTotals.get(verifierVote2);
-                    return voteCount2.compareTo(voteCount1);
-                }
-            });
-
-            // Limit the list to three verifiers. We do not consider ties, as they are inconsequential and do not
-            // justify additional logic complexity.
-            while (topVerifiers.size() > 3) {
-                topVerifiers.remove(topVerifiers.size() - 1);
+        // Make and sort the list descending on votes.
+        Map<ByteBuffer, Integer> voteTotals = voteTotals();
+        List<ByteBuffer> topVerifiers = new ArrayList<>(voteTotals.keySet());
+        Collections.sort(topVerifiers, new Comparator<ByteBuffer>() {
+            @Override
+            public int compare(ByteBuffer verifierVote1, ByteBuffer verifierVote2) {
+                Integer voteCount1 = voteTotals.get(verifierVote1);
+                Integer voteCount2 = voteTotals.get(verifierVote2);
+                return voteCount2.compareTo(voteCount1);
             }
+        });
 
-            StringBuilder verifiersString = new StringBuilder();
-            String separator = "";
-            for (ByteBuffer verifier : topVerifiers) {
-                verifiersString.append(separator).append(NicknameManager.get(verifier.array()));
-                separator = ", ";
-            }
-            System.out.println("top verifiers: " + verifiersString);
+        // Limit the list to three verifiers. We do not consider ties, as they are inconsequential and do not
+        // justify additional logic complexity.
+        while (topVerifiers.size() > 3) {
+            topVerifiers.remove(topVerifiers.size() - 1);
+        }
 
-            // If the verifiers list is empty and this is a new verifier, add it to the list now.
-            if (topVerifiers.isEmpty()) {
-                ByteBuffer verifierIdentifier = ByteBuffer.wrap(Verifier.getIdentifier());
-                if (!votingVerifiers.contains(verifierIdentifier)) {
-                    topVerifiers.add(verifierIdentifier);
-                }
+        // If the verifiers list is empty and this is a new verifier, add it to the list now.
+        if (topVerifiers.isEmpty()) {
+            ByteBuffer verifierIdentifier = ByteBuffer.wrap(Verifier.getIdentifier());
+            if (!BlockManager.verifierInCurrentCycle(verifierIdentifier)) {
+                topVerifiers.add(verifierIdentifier);
             }
         }
 
         return topVerifiers;
     }
 
-    public static synchronized NewVerifierVote getLocalVote() {
+    public static NewVerifierVote getLocalVote() {
 
         return localVote;
     }

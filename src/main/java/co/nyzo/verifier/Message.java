@@ -1,11 +1,15 @@
 package co.nyzo.verifier;
 
+import co.nyzo.verifier.client.Client;
+import co.nyzo.verifier.client.ClientDataManager;
+import co.nyzo.verifier.client.ClientNodeManager;
 import co.nyzo.verifier.messages.*;
 import co.nyzo.verifier.messages.debug.*;
+import co.nyzo.verifier.sentinel.Sentinel;
 import co.nyzo.verifier.util.IpUtil;
+import co.nyzo.verifier.util.LogUtil;
 import co.nyzo.verifier.util.PrintUtil;
 import co.nyzo.verifier.util.SignatureUtil;
-import co.nyzo.verifier.util.UpdateUtil;
 
 import java.io.BufferedInputStream;
 import java.io.InputStream;
@@ -17,14 +21,25 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Message {
 
     private static final long maximumMessageLength = 4194304;  // 4 MB
-    private static final Set<ByteBuffer> whitelist = new HashSet<>();
+    private static final Set<ByteBuffer> whitelist = ConcurrentHashMap.newKeySet();
     private static final Set<MessageType> disallowedNonCycleTypes = new HashSet<>(Arrays.asList(MessageType.NewBlock9,
             MessageType.BlockVote19, MessageType.NewVerifierVote21, MessageType.MissingBlockVoteRequest23,
             MessageType.MissingBlockRequest25));
+    private static final Set<MessageType> udpTypes = new HashSet<>(Arrays.asList(MessageType.BlockVote19,
+            MessageType.NewVerifierVote21));
+    public static final long replayProtectionInterval = 5000L;
+
+    private static DatagramSocket datagramSocket;
+    static {
+        try {
+            datagramSocket = new DatagramSocket();
+        } catch (Exception ignored) { }
+    }
 
     // We do not broadcast any messages to the full mesh from the broadcast method. We do, however, use the full mesh
     // as a potential pool for random requests for the following types. This reduces strain on in-cycle verifiers.
@@ -67,11 +82,6 @@ public class Message {
         // Verify the source signature.
         this.valid = SignatureUtil.signatureIsValid(sourceNodeSignature, getBytesForSigning(),
                 sourceNodeIdentifier);
-        if (!this.valid) {
-            System.out.println("message from " + PrintUtil.compactPrintByteArray(sourceNodeIdentifier) + " of type " +
-                    this.type + " is not valid, content is " + content);
-            System.out.println("signature is " + ByteUtil.arrayAsStringWithDashes(sourceNodeSignature));
-        }
     }
 
     public long getTimestamp() {
@@ -109,23 +119,45 @@ public class Message {
 
     public static void broadcast(Message message) {
 
-        System.out.println("broadcasting message: " + message.getType());
-
         // Send the message to all nodes in the current cycle and the top in the new-verifier queue.
-        Set<ByteBuffer> currentAndNearCycle = BlockManager.verifiersInCurrentAndNearCycleSet();
-        List<Node> mesh = NodeManager.getMesh();
-        for (Node node : mesh) {
-            if (node.isActive() && !ByteUtil.arraysAreEqual(node.getIdentifier(), Verifier.getIdentifier()) &&
-                    currentAndNearCycle.contains(ByteBuffer.wrap(node.getIdentifier()))) {
-                String ipAddress = IpUtil.addressAsString(node.getIpAddress());
-                fetch(ipAddress, node.getPort(), message, null);
+        Set<Node> nodes = BlockManager.getCurrentAndNearCycleNodes();
+        System.out.println("broadcasting message: " + message.getType() + " to " + nodes.size());
+        for (Node node : nodes) {
+            if (node.isActive() && !ByteUtil.arraysAreEqual(node.getIdentifier(), Verifier.getIdentifier())) {
+                fetch(node, message, null);
             }
         }
     }
 
     public static void fetchFromRandomNode(Message message, MessageCallback messageCallback) {
 
-        boolean isFullMeshMessage = fullMeshMessageTypes.contains(message.getType());
+        Node node;
+        switch (RunMode.getRunMode()) {
+            case Client:
+            case MicropayServer:
+                node = ClientNodeManager.randomNode();
+                break;
+            case Sentinel:
+                node = Sentinel.randomNode();
+                break;
+            case Verifier:
+            default:
+                node = randomNode(message.getType());
+                break;
+        }
+
+        if (node == null) {
+            System.out.println("unable to find suitable node for random fetch");
+        } else {
+            LogUtil.println("trying to fetch " + message.getType() + " from " +
+                    NicknameManager.get(node.getIdentifier()));
+            fetch(node, message, messageCallback);
+        }
+    }
+
+    private static Node randomNode(MessageType messageType) {
+
+        boolean isFullMeshMessage = fullMeshMessageTypes.contains(messageType);
 
         Node node = null;
         List<Node> mesh = NodeManager.getMesh();
@@ -139,16 +171,19 @@ public class Message {
             }
         }
 
-        if (node == null) {
-            System.out.println("unable to find suitable node");
+        return node;
+    }
+
+    public static void fetch(Node node, Message message, MessageCallback messageCallback) {
+
+        if (udpTypes.contains(message.getType()) && node.getPortUdp() > 0) {
+            sendUdp(node.getIpAddress(), node.getPortUdp(), message);
         } else {
-            System.out.println("trying to fetch " + message.getType() + " from " +
-                    NicknameManager.get(node.getIdentifier()));
-            fetch(IpUtil.addressAsString(node.getIpAddress()), node.getPort(), message, messageCallback);
+            fetchTcp(IpUtil.addressAsString(node.getIpAddress()), node.getPortTcp(), message, messageCallback);
         }
     }
 
-    public static void fetch(String hostNameOrIp, int port, Message message, MessageCallback messageCallback) {
+    public static void fetchTcp(String hostNameOrIp, int port, Message message, MessageCallback messageCallback) {
 
         byte[] identifier = NodeManager.identifierForIpAddress(hostNameOrIp);
 
@@ -162,29 +197,22 @@ public class Message {
             new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    Socket socket = null;
-                    for (int i = 0; i < 3 && socket == null; i++) {
-                        socket = new Socket();
-                        try {
-                            socket.connect(new InetSocketAddress(hostNameOrIp, port), 3000);
-                        } catch (Exception ignored) {
-                            socket = null;
-                        }
-
-                        if (socket == null) {
+                    Socket socket = new Socket();
+                    try {
+                        socket.connect(new InetSocketAddress(hostNameOrIp, port), 3000);
+                    } catch (Exception e) {
+                        if (socket.isConnected()) {
                             try {
-                                Thread.sleep(100L + (long) (Math.random() * 100));
+                                socket.close();
                             } catch (Exception ignored) { }
                         }
+                        socket = null;
                     }
 
                     Message response = null;
                     if (socket == null) {
-
                         NodeManager.markFailedConnection(hostNameOrIp);
-
                     } else {
-
                         NodeManager.markSuccessfulConnection(hostNameOrIp);
 
                         try {
@@ -206,14 +234,36 @@ public class Message {
                     }
 
                     if (messageCallback != null) {
-                        if (response == null || !response.isValid()) {
-                            MessageQueue.add(messageCallback, null);
-                        } else {
+                        if (response != null && response.isValid() &&
+                                response.getTimestamp() >= System.currentTimeMillis() - replayProtectionInterval &&
+                                response.getTimestamp() <= System.currentTimeMillis() + replayProtectionInterval) {
                             MessageQueue.add(messageCallback, response);
+                        } else {
+                            MessageQueue.add(messageCallback, null);
                         }
                     }
                 }
             }, "Message-fetch-" + message).start();
+        }
+    }
+
+    public static void sendUdp(byte[] ipAddress, int port, Message message) {
+
+        byte[] identifier = NodeManager.identifierForIpAddress(ipAddress);
+
+        // Do not send the message to this verifier, and do not send a message that will get this verifier blacklisted
+        // if it is not in the cycle.
+        if (!ByteUtil.arraysAreEqual(identifier, Verifier.getIdentifier()) &&
+                (BlockManager.verifierInOrNearCurrentCycle(ByteBuffer.wrap(Verifier.getIdentifier())) ||
+                        BlockManager.inGenesisCycle() ||
+                        !disallowedNonCycleTypes.contains(message.getType()))) {
+
+            try {
+                byte[] messageBytes = message.getBytesForTransmission();
+                InetAddress address = Inet4Address.getByAddress(ipAddress);
+                DatagramPacket packet = new DatagramPacket(messageBytes, messageBytes.length, address, port);
+                datagramSocket.send(packet);
+            } catch (Exception ignored) { }
         }
     }
 
@@ -222,11 +272,9 @@ public class Message {
         byte[] response = getResponse(inputStream);
         Message message;
         if (response.length == 0) {
-            System.out.println("empty response from " + IpUtil.addressAsString(sourceIpAddress) + " for message of " +
-                    "type " + sourceType);
             message = null;
         } else {
-            message = fromBytes(response, sourceIpAddress);
+            message = fromBytes(response, sourceIpAddress, false);
         }
 
         return message;
@@ -325,7 +373,7 @@ public class Message {
         return result;
     }
 
-    public static Message fromBytes(byte[] bytes, byte[] sourceIpAddress) {
+    public static Message fromBytes(byte[] bytes, byte[] sourceIpAddress, boolean isUdp) {
 
         Message message = null;
         int typeValue = 0;
@@ -333,7 +381,10 @@ public class Message {
         try {
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
 
-            // The size is discarded before this method, so it is not read here.
+            // For UDP packets, the length is still in the buffer.
+            if (isUdp) {
+                buffer.getInt();
+            }
 
             long timestamp = buffer.getLong();
             typeValue = buffer.getShort() & 0xffff;
@@ -348,9 +399,14 @@ public class Message {
             // the message.
             if (disallowedNonCycleTypes.contains(type) &&
                     !BlockManager.verifierInOrNearCurrentCycle(ByteBuffer.wrap(sourceNodeIdentifier)) &&
-                    !whitelist.contains(ByteBuffer.wrap(sourceIpAddress))) {
+                    !ipIsWhitelisted(sourceIpAddress)) {
 
-                BlacklistManager.addToBlacklist(sourceIpAddress);
+                // Only add the IP to the blacklist if this is a TCP message. IP addresses can be spoofed for UDP
+                // messages. To allow room for sentinels to send new blocks without concern for blacklisting, new-block
+                // messages from unexpected senders are discarded but do not result in blacklisting.
+                if (!isUdp && type != MessageType.NewBlock9) {
+                    BlacklistManager.addToBlacklist(sourceIpAddress);
+                }
 
             } else {
                 byte[] sourceNodeSignature = new byte[FieldByteSize.signature];
@@ -369,87 +425,101 @@ public class Message {
 
     private static MessageObject processContent(MessageType type, ByteBuffer buffer) {
 
-        MessageObject content = null;
-        // Messages 1 and 2 are no longer used.
-        if (type == MessageType.NodeJoin3) {
-            content = NodeJoinMessage.fromByteBuffer(buffer);
-        } else if (type == MessageType.NodeJoinResponse4) {
-            content = NodeJoinResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.Transaction5) {
-            content = Transaction.fromByteBuffer(buffer);
-        } else if (type == MessageType.TransactionResponse6) {
-            content = TransactionResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.PreviousHashResponse8) {
-            content = PreviousHashResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.NewBlock9) {
-            content = NewBlockMessage.fromByteBuffer(buffer);
-        } else if (type == MessageType.BlockRequest11) {
-            content = BlockRequest.fromByteBuffer(buffer);
-        }  else if (type == MessageType.BlockResponse12) {
-            content = BlockResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.TransactionPoolResponse14) {
-            content = TransactionPoolResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.MeshResponse16) {
-            content = MeshResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.StatusResponse18) {
-            content = StatusResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.BlockVote19) {
-            content = BlockVote.fromByteBuffer(buffer);
-        } else if (type == MessageType.NewVerifierVote21) {
-            content = NewVerifierVote.fromByteBuffer(buffer);
-        } else if (type == MessageType.MissingBlockVoteRequest23) {
-            content = MissingBlockVoteRequest.fromByteBuffer(buffer);
-        } else if (type == MessageType.MissingBlockVoteResponse24) {
-            content = BlockVote.fromByteBuffer(buffer);
-        } else if (type == MessageType.MissingBlockRequest25) {
-            content = MissingBlockRequest.fromByteBuffer(buffer);
-        } else if (type == MessageType.MissingBlockResponse26) {
-            content = MissingBlockResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.TimestampResponse28) {
-            content = TimestampResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.HashVoteOverrideRequest29) {
-            content = HashVoteOverrideRequest.fromByteBuffer(buffer);
-        } else if (type == MessageType.HashVoteOverrideResponse30) {
-            content = HashVoteOverrideResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.ConsensusThresholdOverrideRequest31) {
-            content = ConsensusThresholdOverrideRequest.fromByteBuffer(buffer);
-        } else if (type == MessageType.ConsensusThresholdOverrideResponse32) {
-            content = ConsensusThresholdOverrideResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.NewVerifierVoteOverrideRequest33) {
-            content = NewVerifierVoteOverrideRequest.fromByteBuffer(buffer);
-        } else if (type == MessageType.NewVerifierVoteOverrideResponse34) {
-            content = NewVerifierVoteOverrideResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.BootstrapRequestV2_35) {
-            content = BootstrapRequest.fromByteBuffer(buffer);
-        } else if (type == MessageType.BootstrapResponseV2_36) {
-            content = BootstrapResponseV2.fromByteBuffer(buffer);
-        } else if (type == MessageType.BlockWithVotesRequest37) {
-            content = BlockWithVotesRequest.fromByteBuffer(buffer);
-        } else if (type == MessageType.BlockWithVotesResponse38) {
-            content = BlockWithVotesResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.PingResponse201) {
-            content = PingResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.UpdateResponse301) {
-            content = UpdateResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.UnfrozenBlockPoolPurgeResponse405) {
-            content = UnfrozenBlockPoolPurgeResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.UnfrozenBlockPoolStatusResponse407) {
-            content = UnfrozenBlockPoolStatusResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.MeshStatusResponse409) {
-            content = MeshStatusResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.ConsensusTallyStatusResponse413) {
-            content = ConsensusTallyStatusResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.NewVerifierTallyStatusResponse415) {
-            content = NewVerifierTallyStatusResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.BlacklistStatusResponse417) {
-            content = BlacklistStatusResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.ResetResponse501) {
-            content = BooleanMessageResponse.fromByteBuffer(buffer);
-        } else if (type == MessageType.Error65534) {
-            content = ErrorMessage.fromByteBuffer(buffer);
+        switch (type) {
+            // Messages 1 and 2 are no longer used.
+            case NodeJoin3:
+                return NodeJoinMessage.fromByteBuffer(buffer);
+            case NodeJoinResponse4:
+                return NodeJoinResponse.fromByteBuffer(buffer);
+            case Transaction5:
+                return Transaction.fromByteBuffer(buffer);
+            case TransactionResponse6:
+                return TransactionResponse.fromByteBuffer(buffer);
+            case PreviousHashResponse8:
+                return PreviousHashResponse.fromByteBuffer(buffer);
+            case NewBlock9:
+                return NewBlockMessage.fromByteBuffer(buffer);
+            case BlockRequest11:
+                return BlockRequest.fromByteBuffer(buffer);
+            case BlockResponse12:
+                return BlockResponse.fromByteBuffer(buffer);
+            case TransactionPoolResponse14:
+                return TransactionPoolResponse.fromByteBuffer(buffer);
+            case MeshResponse16:
+                return MeshResponse.fromByteBuffer(buffer);
+            case StatusResponse18:
+                return StatusResponse.fromByteBuffer(buffer);
+            case BlockVote19:
+                return BlockVote.fromByteBuffer(buffer);
+            case NewVerifierVote21:
+                return NewVerifierVote.fromByteBuffer(buffer);
+            case MissingBlockVoteRequest23:
+                return MissingBlockVoteRequest.fromByteBuffer(buffer);
+            case MissingBlockVoteResponse24:
+                return BlockVote.fromByteBuffer(buffer);
+            case MissingBlockRequest25:
+                return MissingBlockRequest.fromByteBuffer(buffer);
+            case MissingBlockResponse26:
+                return MissingBlockResponse.fromByteBuffer(buffer);
+            case TimestampResponse28:
+                return TimestampResponse.fromByteBuffer(buffer);
+            case HashVoteOverrideRequest29:
+                return HashVoteOverrideRequest.fromByteBuffer(buffer);
+            case HashVoteOverrideResponse30:
+                return HashVoteOverrideResponse.fromByteBuffer(buffer);
+            case ConsensusThresholdOverrideRequest31:
+                return ConsensusThresholdOverrideRequest.fromByteBuffer(buffer);
+            case ConsensusThresholdOverrideResponse32:
+                return ConsensusThresholdOverrideResponse.fromByteBuffer(buffer);
+            case NewVerifierVoteOverrideRequest33:
+                return NewVerifierVoteOverrideRequest.fromByteBuffer(buffer);
+            case NewVerifierVoteOverrideResponse34:
+                return NewVerifierVoteOverrideResponse.fromByteBuffer(buffer);
+            case BootstrapRequestV2_35:
+                return BootstrapRequest.fromByteBuffer(buffer);
+            case BootstrapResponseV2_36:
+                return BootstrapResponseV2.fromByteBuffer(buffer);
+            case BlockWithVotesRequest37:
+                return BlockWithVotesRequest.fromByteBuffer(buffer);
+            case BlockWithVotesResponse38:
+                return BlockWithVotesResponse.fromByteBuffer(buffer);
+            case VerifierRemovalVote39:
+                return VerifierRemovalVote.fromByteBuffer(buffer);
+            case FullMeshResponse42:
+                return MeshResponse.fromByteBuffer(buffer);
+            case NodeJoinV2_43:
+                return NodeJoinMessageV2.fromByteBuffer(buffer);
+            case NodeJoinResponseV2_44:
+                return NodeJoinResponseV2.fromByteBuffer(buffer);
+            case FrozenEdgeBalanceListResponse_46:
+                return BalanceListResponse.fromByteBuffer(buffer);
+            case PingResponse201:
+                return PingResponse.fromByteBuffer(buffer);
+            case UpdateResponse301:
+                return UpdateResponse.fromByteBuffer(buffer);
+            case UnfrozenBlockPoolPurgeResponse405:
+                return UnfrozenBlockPoolPurgeResponse.fromByteBuffer(buffer);
+            case UnfrozenBlockPoolStatusResponse407:
+                return UnfrozenBlockPoolStatusResponse.fromByteBuffer(buffer);
+            case MeshStatusResponse409:
+                return MeshStatusResponse.fromByteBuffer(buffer);
+            case ConsensusTallyStatusResponse413:
+                return ConsensusTallyStatusResponse.fromByteBuffer(buffer);
+            case NewVerifierTallyStatusResponse415:
+                return NewVerifierTallyStatusResponse.fromByteBuffer(buffer);
+            case BlacklistStatusResponse417:
+                return BlacklistStatusResponse.fromByteBuffer(buffer);
+            case PerformanceScoreStatusResponse419:
+                return PerformanceScoreStatusResponse.fromByteBuffer(buffer);
+            case VerifierRemovalTallyStatusResponse421:
+                return VerifierRemovalTallyStatusResponse.fromByteBuffer(buffer);
+            case ResetResponse501:
+                return BooleanMessageResponse.fromByteBuffer(buffer);
+            case Error65534:
+                return ErrorMessage.fromByteBuffer(buffer);
+            default:
+                return null;
         }
-
-        return content;
     }
 
     public static void putString(String value, ByteBuffer buffer) {
@@ -463,9 +533,32 @@ public class Message {
         }
     }
 
+    public static void putString(String value, ByteBuffer buffer, int maximumStringByteLength) {
+
+        if (value == null) {
+            buffer.putShort((short) 0);
+        } else {
+            byte[] lineBytes = value.getBytes(StandardCharsets.UTF_8);
+            if (lineBytes.length > maximumStringByteLength) {
+                lineBytes = Arrays.copyOf(lineBytes, maximumStringByteLength);
+            }
+            buffer.putShort((short) lineBytes.length);
+            buffer.put(lineBytes);
+        }
+    }
+
     public static String getString(ByteBuffer buffer) {
 
-        int lineByteLength = buffer.getShort() & 0xff;
+        int lineByteLength = buffer.getShort() & 0xffff;
+        byte[] lineBytes = new byte[lineByteLength];
+        buffer.get(lineBytes);
+
+        return new String(lineBytes, StandardCharsets.UTF_8);
+    }
+
+    public static String getString(ByteBuffer buffer, int maximumStringByteLength) {
+
+        int lineByteLength = Math.min(buffer.getShort() & 0xffff, maximumStringByteLength);
         byte[] lineBytes = new byte[lineByteLength];
         buffer.get(lineBytes);
 
@@ -504,6 +597,11 @@ public class Message {
         } else {
             System.out.println("skipping whitelist loading; file not present");
         }
+    }
+
+    public static boolean ipIsWhitelisted(byte[] ipAddress) {
+
+        return whitelist.contains(ByteBuffer.wrap(ipAddress));
     }
 
     @Override

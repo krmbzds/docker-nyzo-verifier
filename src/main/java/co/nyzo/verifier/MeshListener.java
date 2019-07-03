@@ -4,87 +4,259 @@ import co.nyzo.verifier.messages.*;
 import co.nyzo.verifier.messages.debug.*;
 import co.nyzo.verifier.util.IpUtil;
 import co.nyzo.verifier.util.PrintUtil;
+import co.nyzo.verifier.util.ThreadUtil;
 import co.nyzo.verifier.util.UpdateUtil;
 
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiFunction;
 
 public class MeshListener {
 
-    private static long numberOfMessagesRejected = 0;
-    private static long numberOfMessagesAccepted = 0;
+    private static final AtomicLong numberOfMessagesRejected = new AtomicLong(0);
+    private static final AtomicLong numberOfMessagesAccepted = new AtomicLong(0);
+
+    private static final int maximumConcurrentConnectionsForIp = 20;
+
+    private static final AtomicBoolean aliveTcp = new AtomicBoolean(false);
+    private static final AtomicBoolean aliveUdp = new AtomicBoolean(false);
+
+    // The only messages sent via UDP right now are BlockVote19 and NewVerifierVote21. BlockVote19 is the larger of
+    // these.
+    private static final int udpBufferSize = FieldByteSize.messageLength + FieldByteSize.timestamp +  // message fields
+            FieldByteSize.messageType + FieldByteSize.identifier + FieldByteSize.signature +  // message fields
+            FieldByteSize.blockHeight + FieldByteSize.hash + FieldByteSize.timestamp;  // block vote fields
+
+    // To promote forward compatibility with messages we might want to add, the verifier will accept all readable
+    // messages except those explicitly disallowed. The response types should not be processed for incoming messages,
+    // but adding them to this set adds another level of protection.
+    private static final Set<MessageType> disallowedUdpTypes = new HashSet<>(Arrays.asList(MessageType.NodeJoin3,
+            MessageType.NodeJoinResponse4, MessageType.NodeJoinV2_43, MessageType.NodeJoinResponseV2_44));
+
+    private static final int numberOfDatagramPackets = 50000;
+    private static int datagramPacketWriteIndex = 0;
+    private static int datagramPacketReadIndex = 0;
+    private static boolean receivingUdp = false;
+    private static int blockVoteTcpCount = 0;
+    private static int blockVoteUdpCount = 0;
+
+    private static final DatagramPacket[] datagramPackets = new DatagramPacket[numberOfDatagramPackets];
+    static {
+        for (int i = 0; i < numberOfDatagramPackets; i++) {
+            byte[] packetBuffer = new byte[udpBufferSize];
+            datagramPackets[i] = new DatagramPacket(packetBuffer, udpBufferSize);
+        }
+    }
 
     public static void main(String[] args) {
         start();
     }
 
-    private static final AtomicBoolean alive = new AtomicBoolean(false);
-
     public static boolean isAlive() {
-        return alive.get();
+        return aliveTcp.get() || aliveUdp.get();
     }
 
-    public static final int standardPort = 9444;
+    public static final int standardPortTcp = 9444;
+    public static final int standardPortUdp = 9446;
 
-    private static ServerSocket serverSocket = null;
-    private static int port;
+    private static ServerSocket serverSocketTcp = null;
+    private static DatagramSocket datagramSocketUdp = null;
+    private static int portTcp;
+    private static int portUdp;
 
-    public static int getPort() {
-        return port;
+    public static int getPortTcp() {
+        return portTcp;
     }
+
+    public static int getPortUdp() {
+        return portUdp;
+    }
+
+    private static final BiFunction<Integer, Integer, Integer> mergeFunction =
+            new BiFunction<Integer, Integer, Integer>() {
+                @Override
+                public Integer apply(Integer integer0, Integer integer1) {
+                    int value0 = integer0 == null ? 0 : integer0;
+                    int value1 = integer1 == null ? 0 : integer1;
+                    return value0 + value1;
+                }
+            };
 
     public static void start() {
 
-        if (!alive.getAndSet(true)) {
+        if (!aliveTcp.getAndSet(true)) {
+            startSocketThreadTcp();
+        }
 
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        serverSocket = new ServerSocket(standardPort);
-                        port = serverSocket.getLocalPort();
+        if (!aliveUdp.getAndSet(true)) {
+            startSocketThreadUdp();
+        }
+    }
 
-                        while (!UpdateUtil.shouldTerminate()) {
+    public static void startSocketThreadTcp() {
 
-                            if (Verifier.isPaused()) {
-                                try {
-                                    Thread.sleep(1000L);
-                                } catch (Exception ignored) { }
-                            } else {
-                                try {
-                                    Socket clientSocket = serverSocket.accept();
-                                    if (BlacklistManager.inBlacklist(clientSocket.getInetAddress().getAddress())) {
-                                        try {
-                                            numberOfMessagesRejected++;
-                                            clientSocket.close();
-                                        } catch (Exception ignored) { }
-                                    } else {
-                                        numberOfMessagesAccepted++;
-                                        new Thread(new Runnable() {
-                                            @Override
-                                            public void run() {
+        Map<ByteBuffer, Integer> connectionsPerIp = new ConcurrentHashMap<>();
+        AtomicInteger activeReadThreads = new AtomicInteger(0);
 
-                                                readMessageAndRespond(clientSocket);
-                                            }
-                                        }, "MeshListener-clientSocket").start();
-                                    }
-                                } catch (Exception ignored) {
-                                }
-                            }
-                        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    serverSocketTcp = new ServerSocket(standardPortTcp);
+                    portTcp = serverSocketTcp.getLocalPort();
 
-                        closeSocket();
-
-                    } catch (Exception e) {
-
-                        System.err.println("Exception trying to open mesh listener. Exiting.");
-                        UpdateUtil.terminate();
+                    while (!UpdateUtil.shouldTerminate()) {
+                        try {
+                            Socket clientSocket = serverSocketTcp.accept();
+                            processSocket(clientSocket, activeReadThreads, connectionsPerIp);
+                        } catch (Exception ignored) { }
                     }
 
-                    alive.set(false);
+                    closeSockets();
+
+                } catch (Exception e) {
+
+                    System.err.println("Exception trying to open mesh listener. Exiting.");
+                    UpdateUtil.terminate();
                 }
-            }, "MeshListener-serverSocket").start();
+
+                aliveTcp.set(false);
+            }
+        }, "MeshListener-serverSocketTcp").start();
+    }
+
+    private static void startSocketThreadUdp() {
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    datagramSocketUdp = new DatagramSocket(standardPortUdp);
+                    portUdp = datagramSocketUdp.getLocalPort();
+
+                    while (!UpdateUtil.shouldTerminate()) {
+                        try {
+                            // Get the packet.
+                            DatagramPacket packet = datagramPackets[datagramPacketWriteIndex];
+                            datagramSocketUdp.receive(packet);
+
+                            // Mark that we are receiving UDP messages.
+                            receivingUdp = true;
+
+                            // If the buffer is full, do not advance the index. Advancing past the read index would
+                            // cause the entire buffer to be skipped by the read thread.
+                            int newWriteIndex = (datagramPacketWriteIndex + 1) % numberOfDatagramPackets;
+                            if (newWriteIndex == datagramPacketReadIndex) {
+                                StatusResponse.incrementUdpDiscardCount();
+                            } else {
+                                datagramPacketWriteIndex = newWriteIndex;
+                            }
+                        } catch (Exception ignored) { }
+                    }
+
+                } catch (Exception e) {
+
+                    System.err.println("Exception trying to open UDP socket. Exiting.");
+                    UpdateUtil.terminate();
+                }
+
+                aliveUdp.set(false);
+            }
+        }, "MeshListener-datagramSocketUdp").start();
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (!UpdateUtil.shouldTerminate()) {
+                    if (datagramPacketReadIndex == datagramPacketWriteIndex) {
+                        ThreadUtil.sleep(30L);
+                    } else {
+                        // Get the packet from the queue.
+                        DatagramPacket packet = datagramPackets[datagramPacketReadIndex];
+
+                        // Do some simple checks to avoid reading the message if it will not be used.
+                        ByteBuffer sourceIpAddress =  ByteBuffer.wrap(packet.getAddress().getAddress());
+                        if (BlacklistManager.inBlacklist(sourceIpAddress) ||
+                                !NodeManager.ipAddressInCycle(sourceIpAddress)) {
+                                numberOfMessagesRejected.incrementAndGet();
+                                StatusResponse.incrementUdpRejectionCount();
+                        } else {
+                            try {
+                                numberOfMessagesAccepted.incrementAndGet();
+                                readMessage(packet);
+                            } catch (Exception ignored) { }
+                        }
+
+                        datagramPacketReadIndex = (datagramPacketReadIndex + 1) % numberOfDatagramPackets;
+                    }
+                }
+            }
+        }, "MeshListener-udpProcessingQueue").start();
+    }
+
+    private static void processSocket(Socket clientSocket, AtomicInteger activeReadThreads,
+                                      Map<ByteBuffer, Integer> connectionsPerIp) {
+
+        byte[] ipAddress = clientSocket.getInetAddress().getAddress();
+        if (BlacklistManager.inBlacklist(ipAddress)) {
+            try {
+                numberOfMessagesRejected.incrementAndGet();
+                clientSocket.close();
+            } catch (Exception ignored) { }
+        } else {
+            ByteBuffer ipBuffer = ByteBuffer.wrap(ipAddress);
+            int connectionsForIp = connectionsPerIp.merge(ipBuffer, 1, mergeFunction);
+
+            if (connectionsForIp > maximumConcurrentConnectionsForIp && !Message.ipIsWhitelisted(ipAddress)) {
+
+                System.out.println("blacklisting IP " + IpUtil.addressAsString(ipAddress) +
+                        " due to too many concurrent connections");
+
+                // Decrement the counter, add the IP to the blacklist, and close the socket without responding.
+                connectionsPerIp.merge(ipBuffer, -1, mergeFunction);
+                BlacklistManager.addToBlacklist(ipAddress);
+                try {
+                    clientSocket.close();
+                } catch (Exception ignored) { }
+
+            } else {
+
+                // Read the message and respond.
+                numberOfMessagesAccepted.incrementAndGet();
+                activeReadThreads.incrementAndGet();
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+
+                        try {
+                            clientSocket.setSoTimeout(300);
+                            readMessageAndRespond(clientSocket);
+                        } catch (Exception ignored) { }
+
+                        // Decrement the counter for this IP.
+                        connectionsPerIp.merge(ipBuffer, -1, mergeFunction);
+
+                        if (activeReadThreads.decrementAndGet() == 0) {
+
+                            // When the number of active threads is zero, clear the map of
+                            // connections per IP to prevent accumulation of too many IP
+                            // addresses over time.
+                            connectionsPerIp.clear();
+                        }
+                    }
+                }, "MeshListener-clientSocketTcp").start();
+            }
         }
     }
 
@@ -96,15 +268,20 @@ public class MeshListener {
                     MessageType.IncomingRequest65533);
 
             if (message != null) {
+
+                // To aid in debugging receipt of UDP block votes, the verifier produces counts of both TCP and UDP
+                // block votes. This is a temporary feature; it will be removed in a future version.
+                if (message.getType() == MessageType.BlockVote19) {
+                    blockVoteTcpCount++;
+                }
+
                 Message response = response(message);
                 if (response != null) {
                     clientSocket.getOutputStream().write(response.getBytesForTransmission());
                 }
             }
 
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        } catch (Exception ignored) { }
 
         try {
             Thread.sleep(3L);
@@ -112,14 +289,41 @@ public class MeshListener {
         } catch (Exception ignored) { }
     }
 
-    public static void closeSocket() {
+    private static void readMessage(DatagramPacket packet) {
 
-        if (serverSocket != null) {
+        try {
+
+            // Do not use the IP address from the packet. This can be spoofed for UDP. Using an empty address is a
+            // broad protection against a number of attacks that might arise from spoofing addresses.
+            Message message = Message.fromBytes(packet.getData(), new byte[FieldByteSize.ipAddress], true);
+            if (message != null && !disallowedUdpTypes.contains(message.getType())) {
+
+                // To aid in debugging receipt of UDP block votes, the verifier produces counts of both TCP and UDP
+                // block votes. This is a temporary feature; it will be removed in a future version.
+                if (message.getType() == MessageType.BlockVote19) {
+                    blockVoteUdpCount++;
+                }
+
+                // For UDP, we do not send the response.
+                response(message);
+            }
+
+        } catch (Exception ignored) { }
+    }
+
+    public static void closeSockets() {
+
+        if (serverSocketTcp != null) {
             try {
-                serverSocket.close();
+                serverSocketTcp.close();
             } catch (Exception ignored) {
             }
-            serverSocket = null;
+            serverSocketTcp = null;
+        }
+
+        if (datagramSocketUdp != null) {
+            datagramSocketUdp.close();
+            datagramSocketUdp = null;
         }
     }
 
@@ -130,8 +334,10 @@ public class MeshListener {
         Message response = null;
         try {
             // Many actions are taken inside this block as a result of messages. Therefore, we only want to continue if
-            // the message is valid.
-            if (message != null && message.isValid()) {
+            // the message is valid. The timestamp check protects against various replay attacks.
+            if (message != null && message.isValid() &&
+                    message.getTimestamp() >= System.currentTimeMillis() - Message.replayProtectionInterval &&
+                    message.getTimestamp() <= System.currentTimeMillis() + Message.replayProtectionInterval) {
 
                 Verifier.registerMessage();
 
@@ -165,7 +371,7 @@ public class MeshListener {
 
                     BlockRequest request = (BlockRequest) message.getContent();
                     response = new Message(MessageType.BlockResponse12, new BlockResponse(request.getStartHeight(),
-                            request.getEndHeight(), request.includeBalanceList()));
+                            request.getEndHeight(), request.includeBalanceList(), message.getSourceIpAddress()));
 
                 } else if (messageType == MessageType.TransactionPoolRequest13) {
 
@@ -174,11 +380,12 @@ public class MeshListener {
 
                 } else if (messageType == MessageType.MeshRequest15) {
 
-                    response = new Message(MessageType.MeshResponse16, new MeshResponse(NodeManager.getMesh()));
+                    response = new Message(MessageType.MeshResponse16, new MeshResponse(NodeManager.getCycle()));
 
                 } else if (messageType == MessageType.StatusRequest17) {
 
-                    response = new Message(MessageType.StatusResponse18, new StatusResponse());
+                    response = new Message(MessageType.StatusResponse18,
+                            new StatusResponse(message.getSourceNodeIdentifier()));
 
                 } else if (messageType == MessageType.BlockVote19) {
 
@@ -231,8 +438,38 @@ public class MeshListener {
                     long height = ((BlockWithVotesRequest) message.getContent()).getHeight();
                     response = new Message(MessageType.BlockWithVotesResponse38, new BlockWithVotesResponse(height));
 
+                } else if (messageType == MessageType.VerifierRemovalVote39) {
+
+                    VerifierRemovalManager.registerVote(message.getSourceNodeIdentifier(),
+                            (VerifierRemovalVote) message.getContent());
+                    response = new Message(MessageType.VerifierRemovalVoteResponse40, null);
+
+                } else if (messageType == MessageType.FullMeshRequest41) {
+
+                    response = new Message(MessageType.FullMeshResponse42, new MeshResponse(NodeManager.getMesh()));
+
+                } else if (messageType == MessageType.NodeJoinV2_43) {
+
+                    NodeManager.updateNode(message);
+
+                    NodeJoinMessageV2 nodeJoinMessage = (NodeJoinMessageV2) message.getContent();
+                    NicknameManager.put(message.getSourceNodeIdentifier(), nodeJoinMessage.getNickname());
+
+                    // Send a UDP ping to help the node ensure that it is receiving UDP messages
+                    // properly.
+                    Message.sendUdp(message.getSourceIpAddress(), nodeJoinMessage.getPortUdp(),
+                            new Message(MessageType.Ping200, null));
+
+                    response = new Message(MessageType.NodeJoinResponseV2_44, new NodeJoinResponseV2());
+
+                } else if (messageType == MessageType.FrozenEdgeBalanceListRequest_45) {
+
+                    response = new Message(MessageType.FrozenEdgeBalanceListResponse_46,
+                            new BalanceListResponse(message.getSourceIpAddress()));
+
                 } else if (messageType == MessageType.Ping200) {
 
+                    StatusResponse.incrementPingCount();
                     response = new Message(MessageType.PingResponse201, new PingResponse("hello, " +
                             IpUtil.addressAsString(message.getSourceIpAddress()) + "! v=" + Version.getVersion()));
 
@@ -269,9 +506,20 @@ public class MeshListener {
                     response = new Message(MessageType.BlacklistStatusResponse417,
                             new BlacklistStatusResponse(message));
 
+                } else if (messageType == MessageType.PerformanceScoreStatusRequest418) {
+
+                    response = new Message(MessageType.PerformanceScoreStatusResponse419,
+                            new PerformanceScoreStatusResponse(message));
+
+                } else if (messageType == MessageType.VerifierRemovalTallyStatusRequest420) {
+
+                    response = new Message(MessageType.VerifierRemovalTallyStatusResponse421,
+                            new VerifierRemovalTallyStatusResponse(message));
+
                 } else if (messageType == MessageType.ResetRequest500) {
 
-                    boolean success = ByteUtil.arraysAreEqual(message.getSourceNodeIdentifier(), Block.genesisVerifier);
+                    boolean success = ByteUtil.arraysAreEqual(message.getSourceNodeIdentifier(),
+                            Verifier.getIdentifier());
                     String responseMessage;
                     if (success) {
                         responseMessage = "reset request accepted";
@@ -279,7 +527,7 @@ public class MeshListener {
                     } else {
                         responseMessage = "source node identifier, " +
                                 PrintUtil.compactPrintByteArray(message.getSourceNodeIdentifier()) + ", is not the " +
-                                "Genesis verifier, " + PrintUtil.compactPrintByteArray(Block.genesisVerifier);
+                                "local verifier, " + PrintUtil.compactPrintByteArray(Verifier.getIdentifier());
                     }
 
                     response = new Message(MessageType.ResetResponse501, new BooleanMessageResponse(success,
@@ -304,11 +552,21 @@ public class MeshListener {
 
     public static long getNumberOfMessagesRejected() {
 
-        return numberOfMessagesRejected;
+        return numberOfMessagesRejected.get();
     }
 
     public static long getNumberOfMessagesAccepted() {
 
-        return numberOfMessagesAccepted;
+        return numberOfMessagesAccepted.get();
+    }
+
+    public static boolean isReceivingUdp() {
+
+        return receivingUdp;
+    }
+
+    public static String getBlockVoteTcpUdpString() {
+
+        return blockVoteTcpCount + "/" + blockVoteUdpCount;
     }
 }
